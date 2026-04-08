@@ -919,6 +919,7 @@ def main():
             if not ret:
                 print("Frame grab failed.")
                 break
+            color_image = cv2.rotate(color_image, cv2.ROTATE_180)
             cv2.imshow("RGB Camera", color_image)
 
             depth_image = depth_reader.get_latest()
