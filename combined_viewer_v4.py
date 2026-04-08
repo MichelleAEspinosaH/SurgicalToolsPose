@@ -370,15 +370,32 @@ def draw_seg_overlay(image, mask, contour, alpha=SEG_OVERLAY_ALPHA):
 # SIFT helpers  (updated to use segmentation mask)
 # ==============================================================================
 
+def _bbox_mask(shape, bbox):
+    """Returns a uint8 mask with 255 inside bbox, 0 outside."""
+    m = np.zeros(shape[:2], dtype=np.uint8)
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        m[y1:y2, x1:x2] = 255
+    return m
+
+
 def compute_reference_features(ref_gray, ref_color, ref_mask, bbox,
                                 seg_contour, max_features):
     """
-    Detects SIFT keypoints within the segmentation mask.
+    Detects SIFT keypoints within the segmentation mask, clipped to bbox.
+    If ref_mask is None but bbox is given, only the bbox region is searched.
     Draws the bbox (blue), segmentation overlay (magenta), and keypoints (green).
     Returns (kp, des, annotated_image).
     """
+    # Guarantee SIFT never goes outside the bounding box
+    if bbox is not None:
+        bm = _bbox_mask(ref_gray.shape, bbox)
+        detect_mask = cv2.bitwise_and(ref_mask, bm) if ref_mask is not None else bm
+    else:
+        detect_mask = ref_mask
+
     sift    = cv2.SIFT_create(nfeatures=max_features)
-    kp, des = sift.detectAndCompute(ref_gray, ref_mask)
+    kp, des = sift.detectAndCompute(ref_gray, detect_mask)
 
     viz = ref_color.copy()
     # Draw segmentation overlay first (behind bbox and keypoints)
@@ -396,8 +413,17 @@ def compute_reference_features(ref_gray, ref_color, ref_mask, bbox,
     return kp, des, viz
 
 
-def get_sift_points_in_frame(ref_kp, ref_des, query_gray, query_mask, max_features):
-    """SIFT matching — unchanged from v3."""
+def get_sift_points_in_frame(ref_kp, ref_des, query_gray, query_mask, max_features,
+                              bbox=None):
+    """
+    SIFT matching restricted to the object bounding box.
+    If bbox is given, query_mask is further clipped to bbox so keypoints are
+    only detected inside the box — nothing in the background is matched.
+    """
+    if bbox is not None:
+        bm = _bbox_mask(query_gray.shape, bbox)
+        query_mask = cv2.bitwise_and(query_mask, bm) if query_mask is not None else bm
+
     sift      = cv2.SIFT_create()
     kp2, des2 = sift.detectAndCompute(query_gray, query_mask)
     if ref_des is None or des2 is None or len(ref_des) < 2 or len(des2) < 2:
@@ -483,13 +509,16 @@ def record_and_reconstruct_3d(cap, depth_reader, yolo_model, cam_matrix, max_fea
         rgb, raw_d   = recorded[i]
         rgb_h, rgb_w = rgb.shape[:2]
 
-        # Use the segmentation mask for keyframe extraction too
+        # Use the segmentation mask clipped to bbox for keyframe extraction
         mask, bbox, _, _, _ = get_object_mask(rgb, yolo_model)
         if bbox is None:
             continue
 
-        gray    = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
-        kp, des = sift.detectAndCompute(gray, mask)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
+        # Clip mask to bbox so SIFT only fires inside the detected object
+        detect_mask = cv2.bitwise_and(mask, _bbox_mask(gray.shape, bbox)) \
+                      if mask is not None else _bbox_mask(gray.shape, bbox)
+        kp, des = sift.detectAndCompute(gray, detect_mask)
         if not kp or des is None:
             continue
 
@@ -1002,6 +1031,7 @@ def main():
             cv2.imshow("RGB Camera", color_image)
 
             depth_image = depth_reader.get_latest()
+            depth_image = cv2.rotate(depth_image, cv2.ROTATE_180)
             if depth_image is not None:
                 cv2.imshow("Depth Viewer", depth_image)
 
@@ -1046,14 +1076,14 @@ def main():
                             com_mask = cv2.bitwise_and(com_mask, live_mask)
                         pts, obj3d = get_sift_points_in_frame(
                             reference_kp, reference_des, query_gray, com_mask,
-                            max_features_holder[0],
+                            max_features_holder[0], bbox=live_bbox,
                         )
 
                     # Fall back to full live seg mask
                     if (pts is None or len(pts) == 0) and live_mask is not None:
                         pts, obj3d = get_sift_points_in_frame(
                             reference_kp, reference_des, query_gray, live_mask,
-                            max_features_holder[0],
+                            max_features_holder[0], bbox=live_bbox,
                         )
 
                     if pts is not None and len(pts) > 0:
