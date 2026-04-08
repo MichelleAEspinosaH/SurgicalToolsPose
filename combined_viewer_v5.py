@@ -37,6 +37,7 @@
 import os
 import time
 import threading
+from collections import deque
 
 import cv2
 import numpy as np
@@ -54,6 +55,7 @@ IOU_THRESHOLD  = 0.30     # NMS overlap threshold — lower value keeps nearby/o
 TRACKER        = "bytetrack.yaml"   # built into ultralytics; swap for botrack.yaml
 
 MASK_ALPHA     = 0.40     # opacity of the segmentation fill (0 = invisible)
+TRAIL_LENGTH   = 60       # number of past centre positions kept per tracked ID
 
 # Path to the fine-tuned segmentation model (produced by train_yolo_seg.py).
 YOLO_SEG_MODEL_PATH = "runs/segment/surgical_tools_seg/weights/best.pt"
@@ -179,19 +181,39 @@ def depth_at_point(cx, cy, raw_depth, frame_w, frame_h):
     return float(raw_depth[dy, dx])
 
 
-def draw_instances(frame, results, raw_depth):
+def draw_instances(frame, results, raw_depth, trails):
     """
     Draws instance segmentation results onto frame:
+      • path trail showing where each tracked ID has moved (fading line)
       • semi-transparent coloured mask fill per instance
       • contour outline
       • bounding box
       • label: tracking ID, class name, confidence
       • depth value at the instance centre (if depth is available)
 
+    trails — dict[track_id → deque of (cx, cy)] maintained by the caller.
     Instances whose class name is in EXCLUDED_CLASSES are skipped.
     """
-    out   = frame.copy()
+    out    = frame.copy()
     fh, fw = frame.shape[:2]
+
+    # --- Draw all stored trails first (behind everything else) ---------------
+    for tid, pts in trails.items():
+        color = instance_color(tid)
+        pts   = list(pts)
+        n     = len(pts)
+        for i in range(1, n):
+            # Fade from dim at the tail to full brightness at the tip
+            alpha = i / n
+            seg_c = tuple(int(c * alpha) for c in color)
+            thickness = max(1, int(alpha * 3))
+            cv2.line(out,
+                     (int(pts[i - 1][0]), int(pts[i - 1][1])),
+                     (int(pts[i][0]),     int(pts[i][1])),
+                     seg_c, thickness, lineType=cv2.LINE_AA)
+        # Dot at the current tip
+        if pts:
+            cv2.circle(out, (int(pts[-1][0]), int(pts[-1][1])), 4, color, -1)
 
     if results is None or len(results) == 0:
         return out
@@ -342,6 +364,9 @@ def main():
     print(f"Tracker : {TRACKER}")
     print(f"Model   : {YOLO_SEG_MODEL_PATH if os.path.exists(YOLO_SEG_MODEL_PATH) else FALLBACK_SEG_MODEL}")
 
+    # trails[track_id] → deque of (cx, cy) centre positions
+    trails = {}
+
     while True:
         try:
             # --- Read RGB frame and rotate 180° -------------------------------
@@ -359,7 +384,6 @@ def main():
                 cv2.imshow("Depth", depth_display)
 
             # --- YOLO: track + segment ----------------------------------------
-            # persist=True tells ByteTrack to maintain ID state between calls.
             results = yolo_model.track(
                 source  = frame,
                 persist = True,
@@ -369,8 +393,25 @@ def main():
                 verbose = False,
             )
 
+            # --- Update trails with each tracked instance's centre -----------
+            if results and results[0].boxes is not None and results[0].boxes.id is not None:
+                boxes = results[0].boxes
+                fh, fw = frame.shape[:2]
+                for i in range(len(boxes)):
+                    cls_name = results[0].names.get(int(boxes.cls[i]), "")
+                    if cls_name.lower() in EXCLUDED_CLASSES:
+                        continue
+                    if float(boxes.conf[i]) < CONF_THRESHOLD:
+                        continue
+                    tid      = int(boxes.id[i])
+                    x1, y1, x2, y2 = map(int, boxes.xyxy[i])
+                    cx, cy   = (x1 + x2) // 2, (y1 + y2) // 2
+                    if tid not in trails:
+                        trails[tid] = deque(maxlen=TRAIL_LENGTH)
+                    trails[tid].append((cx, cy))
+
             # --- Draw and show ------------------------------------------------
-            tracking_frame = draw_instances(frame, results, raw_depth)
+            tracking_frame = draw_instances(frame, results, raw_depth, trails)
             cv2.imshow("Tracking", tracking_frame)
 
             # --- Quit ---------------------------------------------------------
