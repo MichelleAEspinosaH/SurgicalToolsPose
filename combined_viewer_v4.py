@@ -57,7 +57,7 @@ PRINT_INTERVAL    = 1
 MIN_DEPTH         = 20
 MAX_DEPTH         = 10000
 TRAIL_LENGTH      = 50
-REINIT_RATIO      = 0.3
+REINIT_RATIO      = 0.2
 MAX_FEATURES      = 30
 COM_SMOOTH        = 0.2
 POSE_SMOOTH       = 0.15
@@ -755,6 +755,25 @@ class COMTracker:
             except Exception:
                 pass
 
+    def add_points(self, gray, new_pts, new_obj3d):
+        """Merge newly SIFT-matched points into the existing tracked set."""
+        if self.points is None or len(self.points) == 0:
+            self.initialise(gray, new_pts, new_obj3d,
+                            ref_bbox=self.ref_bbox, preserve_com=True)
+            return
+        start_idx = (max(self.trails.keys()) + 1) if self.trails else 0
+        for j, (pt, obj) in enumerate(zip(new_pts, new_obj3d)):
+            idx = start_idx + j
+            self.trails[idx] = deque(maxlen=TRAIL_LENGTH)
+            x, y = float(pt[0][0]), float(pt[0][1])
+            self.trails[idx].append((x, y))
+            self.init_positions[idx] = (x, y)
+        self.points     = np.concatenate([self.points,     new_pts],    axis=0)
+        self.obj_pts_3d = np.concatenate([self.obj_pts_3d, new_obj3d],  axis=0)
+        if len(self.points) > self.original_count:
+            self.original_count = len(self.points)
+        self.prev_gray = gray.copy()
+
     def draw(self, image, cam_matrix, dist_coeffs,
              live_bbox=None, live_seg_mask=None, live_contour=None):
         out = image.copy()
@@ -1002,6 +1021,17 @@ def main():
                     live_bbox    = ref_bbox
                     live_contour = ref_contour
 
+                # Always update existing points via optical flow.
+                # The seg mask is NOT used for culling here — it is imperfect
+                # and would drop valid points on the tool if even slightly off.
+                # Bbox cull alone is sufficient to stop background drift.
+                tracker.update(
+                    query_gray, cam_matrix, dist_coeffs,
+                    live_bbox=live_bbox,
+                )
+
+                # If below 20 % threshold, try to seed additional SIFT points
+                # and MERGE them with the surviving tracked set.
                 if tracker.needs_reinit:
                     pts, obj3d = None, None
                     last_com   = tracker.last_known_com
@@ -1012,7 +1042,6 @@ def main():
                         cx_s, cy_s   = int(last_com[0]), int(last_com[1])
                         com_mask     = np.zeros((h_img, w_img), dtype=np.uint8)
                         cv2.circle(com_mask, (cx_s, cy_s), COM_SEARCH_RADIUS, 255, -1)
-                        # Intersect with live seg mask if available
                         if live_mask is not None:
                             com_mask = cv2.bitwise_and(com_mask, live_mask)
                         pts, obj3d = get_sift_points_in_frame(
@@ -1028,18 +1057,17 @@ def main():
                         )
 
                     if pts is not None and len(pts) > 0:
-                        tracker.initialise(
-                            query_gray, pts, obj3d,
-                            ref_bbox=tracker.ref_bbox,
-                            preserve_com=True,
-                        )
-                        print(f"Re-initialised with {len(pts)} pts.")
-                else:
-                    tracker.update(
-                        query_gray, cam_matrix, dist_coeffs,
-                        live_bbox=live_bbox,
-                        live_seg_mask=live_mask,
-                    )
+                        if tracker.active_count > 0:
+                            # Keep surviving points and add fresh ones on top
+                            tracker.add_points(query_gray, pts, obj3d)
+                            print(f"Added {len(pts)} pts  (total {tracker.active_count}).")
+                        else:
+                            tracker.initialise(
+                                query_gray, pts, obj3d,
+                                ref_bbox=tracker.ref_bbox,
+                                preserve_com=True,
+                            )
+                            print(f"Re-initialised with {len(pts)} pts.")
 
                 tracking_image = tracker.draw(
                     color_image, cam_matrix, dist_coeffs,
