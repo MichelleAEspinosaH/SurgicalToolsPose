@@ -50,7 +50,7 @@ MIN_DEPTH      = 20       # mm
 MAX_DEPTH      = 10000    # mm
 
 CONF_THRESHOLD = 0.35     # minimum detection confidence shown
-IOU_THRESHOLD  = 0.45     # NMS overlap threshold
+IOU_THRESHOLD  = 0.30     # NMS overlap threshold — lower value keeps nearby/overlapping tools separate
 TRACKER        = "bytetrack.yaml"   # built into ultralytics; swap for botrack.yaml
 
 MASK_ALPHA     = 0.40     # opacity of the segmentation fill (0 = invisible)
@@ -59,8 +59,9 @@ MASK_ALPHA     = 0.40     # opacity of the segmentation fill (0 = invisible)
 YOLO_SEG_MODEL_PATH = "runs/segment/surgical_tools_seg/weights/best.pt"
 FALLBACK_SEG_MODEL  = "yolo26n-seg.pt"
 
-# Classes to ignore even when detected — keeps hands/arms out of the overlay.
-EXCLUDED_CLASSES = {"human", "person", "hand", "arm"}
+# Classes to ignore even when detected.
+# Hand/arm exclusion removed — occlusion by the hand was causing tracking loss.
+EXCLUDED_CLASSES = set()
 # ------------------------------------------------------------------------------
 
 
