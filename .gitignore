@@ -19,6 +19,15 @@ venv/
 .venv/
 env/
 
+# ── Model weights (too large for GitHub) ──────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+
+# ── Datasets (too large for GitHub) ───────────────────────────────────────────
+dataset_merged/
+dataset_sources/
+
 # ── macOS metadata ─────────────────────────────────────────────────────────────
 .DS_Store
 
