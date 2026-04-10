@@ -38,7 +38,7 @@
 #  Depth Viewer       : depth colormap (rotated 180° to match RGB)
 #  Detection + SIFT   : YOLO plot + full-frame SIFT (only before tracking)
 #  Reference Features : annotated snapshot used as tracking seed
-#  Tracking           : optical-flow trails, COM, pose axes, warped bbox
+#  Tracking           : per object ID — own SIFT ref + optical-flow / COM / pose
 #  3-D Tool Model     : interactive scatter plot (separate process)
 #
 #  SAM 2 video (optional): export CLEAN_FULL_SAM2=1 to segment/track inside
@@ -81,6 +81,11 @@ ENABLE_SAM2_VIDEO = os.environ.get("CLEAN_FULL_SAM2", "").lower() in (
     "yes",
 )
 EXCLUDED_CLASSES = {"human", "person", "hand", "arm"}
+
+# Drop queued RGB frames before each grab (reduces latency when the pipeline is slower than the camera).
+CAM_BUFFER_FLUSH_GRABS = int(os.environ.get("CLEAN_FULL_CAM_FLUSH", "4"))
+# Minimum IoU to keep the same track_id across frames when matching boxes.
+TRACK_IOU_MATCH_THRESH = float(os.environ.get("CLEAN_FULL_TRACK_IOU", "0.25"))
 
 LK_PARAMS = dict(
     winSize  = (21, 21),
@@ -218,6 +223,108 @@ def get_object_mask_from_results(r, hw, yolo_model):
     return mask, (x1, y1, x2, y2), cls_name, conf
 
 
+def bbox_iou_xyxy(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = ix2 - ix1, iy2 - iy1
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    aa = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    bb = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = aa + bb - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def enumerate_valid_detections(r, hw, yolo_model):
+    """
+    All non-excluded YOLO boxes as dicts: bbox, mask, cls_name, conf, cls_id, yolo_idx.
+    Sorted by confidence (highest first).
+    """
+    h, w = hw[0], hw[1]
+    if r.boxes is None or len(r.boxes) == 0:
+        return []
+
+    boxes = r.boxes
+    valid = [
+        i
+        for i in range(len(boxes))
+        if str(yolo_model.names.get(int(boxes.cls[i]), "")).lower()
+        not in EXCLUDED_CLASSES
+    ]
+    if not valid:
+        return []
+
+    valid.sort(key=lambda i: float(boxes.conf[i]), reverse=True)
+    out = []
+    for i in valid:
+        x1, y1, x2, y2 = map(int, boxes.xyxy[i])
+        cls_id = int(boxes.cls[i])
+        conf = float(boxes.conf[i])
+        cls_name = yolo_model.names.get(cls_id, str(cls_id))
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[y1:y2, x1:x2] = 255
+        out.append(
+            {
+                "yolo_idx": i,
+                "bbox": (x1, y1, x2, y2),
+                "mask": mask,
+                "cls_name": cls_name,
+                "conf": conf,
+                "cls_id": cls_id,
+            }
+        )
+    return out
+
+
+def assign_track_ids_to_detections(
+    detections,
+    id_to_bbox: dict,
+    next_id_start: int,
+    iou_thresh: float = TRACK_IOU_MATCH_THRESH,
+):
+    """
+    Greedy IoU matching then new IDs. Sets det['track_id'] on each detection.
+    Returns (next_id_after_max_assigned, new_id_to_bbox for this frame).
+    """
+    if not detections:
+        # Keep last boxes so IDs can match again after a brief missed detection.
+        return next_id_start, dict(id_to_bbox)
+
+    pairs = []
+    for di, det in enumerate(detections):
+        for tid, pb in id_to_bbox.items():
+            iou = bbox_iou_xyxy(det["bbox"], pb)
+            if iou >= iou_thresh:
+                pairs.append((iou, di, int(tid)))
+    pairs.sort(key=lambda x: -x[0])
+
+    det_to_tid = {}
+    used_di = set()
+    used_tid = set()
+    for iou, di, tid in pairs:
+        if di in used_di or tid in used_tid:
+            continue
+        det_to_tid[di] = tid
+        used_di.add(di)
+        used_tid.add(tid)
+
+    nid = next_id_start
+    for di in range(len(detections)):
+        if di not in det_to_tid:
+            det_to_tid[di] = nid
+            nid += 1
+
+    new_map = {}
+    for di, det in enumerate(detections):
+        tid = det_to_tid[di]
+        det["track_id"] = tid
+        new_map[tid] = det["bbox"]
+    return nid, new_map
+
+
 def get_object_mask(color_image, yolo_model):
     """
     Runs YOLO and returns (mask, bbox, cls_name, conf) for the highest-
@@ -277,9 +384,9 @@ def get_sift_points_in_frame(ref_kp, ref_des, query_gray, query_mask, max_featur
     return live_pts, obj_pts_3d
 
 
-def point_color(idx):
-    """Unique BGR colour per point index spread around the HSV wheel."""
-    hue = (idx * 37) % 180
+def point_color(idx, hue_base: int = 0):
+    """Unique BGR colour per point index; hue_base separates different tracked objects."""
+    hue = (hue_base + idx * 37) % 180
     hsv = np.uint8([[[hue, 220, 255]]])
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
     return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
@@ -721,9 +828,26 @@ class COMTracker:
             except Exception:
                 pass
 
-    def draw(self, image, cam_matrix, dist_coeffs, live_bbox=None):
+    def draw(self, image, cam_matrix, dist_coeffs, live_bbox=None,
+             hue_shift: int = 0, status_y: int = 24, track_label: str = ""):
         out = image.copy()
+        self.draw_on(
+            out, cam_matrix, dist_coeffs, live_bbox=live_bbox,
+            hue_shift=hue_shift, status_y=status_y, track_label=track_label,
+        )
+        return out
 
+    def draw_on(
+        self,
+        out,
+        cam_matrix,
+        dist_coeffs,
+        live_bbox=None,
+        hue_shift: int = 0,
+        status_y: int = 24,
+        track_label: str = "",
+    ):
+        """Draw trails / COM / pose on an existing BGR image (for multi-object)."""
         # Live YOLO bbox (green)
         if live_bbox is not None:
             x1, y1, x2, y2 = live_bbox
@@ -736,7 +860,7 @@ class COMTracker:
             pts = list(trail)
             if not pts:
                 continue
-            color = point_color(idx)
+            color = point_color(idx, hue_base=hue_shift)
             n     = len(pts)
             for i in range(1, n):
                 brightness = i / n
@@ -829,9 +953,16 @@ class COMTracker:
             cv2.putText(out, "searching…", (gx + 16, gy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, ghost_color, 1)
 
-        cv2.putText(out, f"Tracking: {self.active_count} pts",
-                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        return out
+        label = track_label.strip() or "Track"
+        cv2.putText(
+            out,
+            f"{label}: {self.active_count} pts",
+            (10, status_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+        )
 
     @property
     def active_count(self):
@@ -891,6 +1022,24 @@ def main():
         print("Could not open RGB camera.")
         return
     print("RGB camera opened.")
+    rgb_fps = cap.get(cv2.CAP_PROP_FPS)
+    rgb_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    rgb_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    rgb_fps_note = (
+        ""
+        if (rgb_fps and rgb_fps > 0)
+        else " — if 0, driver did not report FPS (actual rate is device-dependent)"
+    )
+    print(f"RGB stream: {rgb_w}x{rgb_h}, CAP_PROP_FPS={rgb_fps}{rgb_fps_note}")
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    if CAM_BUFFER_FLUSH_GRABS > 0:
+        print(
+            f"RGB buffer: flush {CAM_BUFFER_FLUSH_GRABS} grab(s) per frame "
+            f"(CLEAN_FULL_CAM_FLUSH to change)",
+        )
 
     # --- Depth sensor (Orbbec SDK) -------------------------------------------
     config   = Config()
@@ -901,6 +1050,13 @@ def main():
         depth_profile = profile_list.get_default_video_stream_profile()
         assert depth_profile is not None
         print("Depth profile:", depth_profile)
+        try:
+            dw = depth_profile.get_width()
+            dh = depth_profile.get_height()
+            dfps = depth_profile.get_fps()
+            print(f"Depth stream (profile): {dw}x{dh} @ {dfps} FPS")
+        except Exception as e:
+            print("Depth stream: could not read width/height/FPS from profile:", e)
         config.enable_stream(depth_profile)
     except Exception as e:
         print("Could not configure depth stream:", e)
@@ -929,17 +1085,13 @@ def main():
 
     print("\nControls:")
     print("  v       — record 3-D reference (NEW: move tool to show all sides)")
-    print("  r       — single-frame reference with YOLO auto-detect")
+    print("  r       — single-frame reference: SIFT + track each YOLO object (IDs on screen)")
     print("  t       — freeze frame and draw your own ROI")
     print("  q / ESC — quit\n")
 
-    reference_gray = None
-    reference_kp   = None
-    reference_des  = None
-    ref_mask_saved = None
-    ref_bbox       = None
-
-    tracker = COMTracker()
+    active_tracks: dict = {}  # track_id -> {tracker, ref_kp, ref_des, ref_bbox, cls}
+    next_track_id = [1]
+    track_bbox_memory: dict = {}
 
     max_features_holder = [MAX_FEATURES]
     cv2.namedWindow("Tracking")
@@ -951,6 +1103,8 @@ def main():
 
     while True:
         try:
+            for _ in range(max(0, CAM_BUFFER_FLUSH_GRABS)):
+                cap.grab()
             ret, color_image = cap.read()
             if not ret:
                 print("Frame grab failed.")
@@ -965,8 +1119,9 @@ def main():
 
             results = yolo_model(color_image, conf=YOLO_CONF, verbose=False)[0]
             h, w = color_image.shape[:2]
-            live_mask, live_bbox, _, _ = get_object_mask_from_results(
-                results, (h, w), yolo_model
+            dets = enumerate_valid_detections(results, (h, w), yolo_model)
+            next_track_id[0], track_bbox_memory = assign_track_ids_to_detections(
+                dets, track_bbox_memory, next_track_id[0]
             )
 
             if sam2_tracker is not None:
@@ -976,10 +1131,23 @@ def main():
                     cv2.imshow("SAM2 track", svis)
 
             # ------------------------------------------------------------------
-            # Idle: YOLO plot + full-frame SIFT (former clean_full behaviour)
+            # Idle: YOLO plot + full-frame SIFT + persistent track IDs
             # ------------------------------------------------------------------
-            if reference_gray is None:
+            if not active_tracks:
                 det_vis = results.plot()
+                for det in dets:
+                    x1, y1, x2, y2 = det["bbox"]
+                    tid = det["track_id"]
+                    lab = f"ID{tid} {det['cls_name']}"
+                    cv2.putText(
+                        det_vis,
+                        lab,
+                        (x1, max(18, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 255),
+                        2,
+                    )
                 g = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
                 kp_prev, _ = sift_preview.detectAndCompute(g, None)
                 det_vis = cv2.drawKeypoints(
@@ -1000,55 +1168,92 @@ def main():
                     det_window_open = False
 
             # ------------------------------------------------------------------
-            # Tracking loop
+            # Tracking loop (per track_id: own SIFT reference + COMTracker)
             # ------------------------------------------------------------------
-            if reference_gray is not None:
+            if active_tracks:
                 query_gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                sorted_tids = sorted(active_tracks.keys())
 
-                if tracker.needs_reinit:
-                    pts, obj3d = None, None
-                    last_com   = tracker.last_known_com
+                for tid in sorted_tids:
+                    st = active_tracks[tid]
+                    tr = st["tracker"]
+                    ref_kp = st["ref_kp"]
+                    ref_des = st["ref_des"]
+                    ref_bbox = st["ref_bbox"]
+                    live_det = next(
+                        (d for d in dets if d["track_id"] == tid),
+                        None,
+                    )
+                    live_bbox = live_det["bbox"] if live_det else None
+                    live_mask = live_det["mask"] if live_det else None
 
-                    # --- Step 1: search around the last known COM first ----------
-                    # This keeps tracking alive even when the hand briefly
-                    # covers the tool or the tool is turned away from YOLO.
-                    if last_com is not None:
-                        h_img, w_img = color_image.shape[:2]
-                        cx_s, cy_s   = int(last_com[0]), int(last_com[1])
-                        com_mask     = np.zeros((h_img, w_img), dtype=np.uint8)
-                        cv2.circle(com_mask, (cx_s, cy_s), COM_SEARCH_RADIUS, 255, -1)
-                        pts, obj3d = get_sift_points_in_frame(
-                            reference_kp, reference_des, query_gray, com_mask,
-                            max_features_holder[0],
-                        )
+                    if tr.needs_reinit:
+                        pts, obj3d = None, None
+                        last_com = tr.last_known_com
 
-                    # --- Step 2: fall back to YOLO mask if COM search failed ----
-                    if (pts is None or len(pts) == 0) and live_mask is not None:
-                        pts, obj3d = get_sift_points_in_frame(
-                            reference_kp, reference_des, query_gray, live_mask,
-                            max_features_holder[0],
-                        )
+                        if last_com is not None:
+                            h_img, w_img = color_image.shape[:2]
+                            cx_s, cy_s = int(last_com[0]), int(last_com[1])
+                            com_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                            cv2.circle(
+                                com_mask, (cx_s, cy_s), COM_SEARCH_RADIUS, 255, -1
+                            )
+                            pts, obj3d = get_sift_points_in_frame(
+                                ref_kp,
+                                ref_des,
+                                query_gray,
+                                com_mask,
+                                max_features_holder[0],
+                            )
 
-                    if pts is not None and len(pts) > 0:
-                        # preserve_com=True so the COM indicator doesn't jump
-                        tracker.initialise(
-                            query_gray, pts, obj3d,
-                            ref_bbox=tracker.ref_bbox,
-                            preserve_com=True,
-                        )
-                        print(f"Re-initialised with {len(pts)} pts "
-                              f"({'COM region' if last_com else 'YOLO mask'}).")
+                        if (pts is None or len(pts) == 0) and live_mask is not None:
+                            pts, obj3d = get_sift_points_in_frame(
+                                ref_kp,
+                                ref_des,
+                                query_gray,
+                                live_mask,
+                                max_features_holder[0],
+                            )
+
+                        if pts is not None and len(pts) > 0:
+                            tr.initialise(
+                                query_gray,
+                                pts,
+                                obj3d,
+                                ref_bbox=tr.ref_bbox,
+                                preserve_com=True,
+                            )
+                            print(
+                                f"ID{tid}: re-init {len(pts)} pts "
+                                f"({'COM' if last_com else 'YOLO mask'}).",
+                            )
                     else:
-                        # Object is fully out of view — hold the last COM position
-                        # and draw a ghost indicator; will retry next frame.
-                        pass
-                else:
-                    tracker.update(query_gray, cam_matrix, dist_coeffs,
-                                   live_bbox=live_bbox)
+                        tr.update(
+                            query_gray,
+                            cam_matrix,
+                            dist_coeffs,
+                            live_bbox=live_bbox,
+                        )
 
-                tracking_image = tracker.draw(
-                    color_image, cam_matrix, dist_coeffs, live_bbox=live_bbox
-                )
+                tracking_image = color_image.copy()
+                for row, tid in enumerate(sorted_tids):
+                    st = active_tracks[tid]
+                    tr = st["tracker"]
+                    live_det = next(
+                        (d for d in dets if d["track_id"] == tid),
+                        None,
+                    )
+                    live_bbox = live_det["bbox"] if live_det else None
+                    lbl = f"ID{tid} {st.get('cls', '')}"
+                    tr.draw_on(
+                        tracking_image,
+                        cam_matrix,
+                        dist_coeffs,
+                        live_bbox=live_bbox,
+                        hue_shift=(tid * 41) % 180,
+                        status_y=22 + row * 26,
+                        track_label=lbl,
+                    )
                 cv2.imshow("Tracking", tracking_image)
 
             # ------------------------------------------------------------------
@@ -1078,60 +1283,75 @@ def main():
                 # Show the annotated reference image
                 cv2.imshow("Reference Features", ref_viz)
 
-                # Set up tracker with real 3-D obj_pts
-                reference_gray = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY)
-                reference_kp   = ref_kp_3d
-                reference_des  = ref_des_3d
-
+                ref_gray_3d = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY)
                 init_pts = np.array([[k.pt] for k in ref_kp_3d], dtype=np.float32)
 
-                tracker.reset()
+                tid = next_track_id[0]
+                next_track_id[0] += 1
+                active_tracks.clear()
+                tr = COMTracker()
                 if len(init_pts) > 0:
-                    tracker.initialise(
-                        reference_gray, init_pts, ref_obj3d, ref_bbox=ref_bbox
-                    )
-                    print(f"3-D reference ready — tracking {len(init_pts)} points.")
+                    tr.initialise(ref_gray_3d, init_pts, ref_obj3d, ref_bbox=ref_bbox)
+                    active_tracks[tid] = {
+                        "tracker": tr,
+                        "ref_kp": ref_kp_3d,
+                        "ref_des": ref_des_3d,
+                        "ref_bbox": ref_bbox,
+                        "cls": "3D",
+                    }
+                    if ref_bbox is not None:
+                        track_bbox_memory.clear()
+                        track_bbox_memory[tid] = ref_bbox
+                    print(f"3-D reference ready — ID{tid}, {len(init_pts)} points.")
                 else:
                     print("3-D reference built but no keypoints found.")
 
             # ------ r : single-frame reference --------------------------------
             elif key == ord("r"):
-                ref_color      = color_image.copy()
-                reference_gray = cv2.cvtColor(ref_color, cv2.COLOR_BGR2GRAY)
+                ref_color = color_image.copy()
+                ref_gray = cv2.cvtColor(ref_color, cv2.COLOR_BGR2GRAY)
+                if not dets:
+                    print("No valid YOLO detections on this frame — use 't' or try again.")
+                    continue
 
-                if yolo_model:
-                    ref_mask_saved, ref_bbox, ref_cls, ref_conf = get_object_mask(
-                        ref_color, yolo_model
+                active_tracks.clear()
+                last_viz = None
+                for det in dets:
+                    tid = det["track_id"]
+                    kp, des, ref_viz = compute_reference_features(
+                        ref_gray,
+                        ref_color,
+                        det["mask"],
+                        det["bbox"],
+                        max_features_holder[0],
                     )
-                    if ref_bbox is not None:
-                        print(f"  YOLO: {ref_cls}  conf={ref_conf:.2f}  bbox={ref_bbox}")
-                else:
-                    ref_mask_saved, ref_bbox = None, None
-
-                reference_kp, reference_des, ref_viz = compute_reference_features(
-                    reference_gray, ref_color, ref_mask_saved, ref_bbox,
-                    max_features_holder[0],
-                )
-                cv2.imshow("Reference Features", ref_viz)
-
-                init_pts   = np.array([[kp.pt] for kp in reference_kp], dtype=np.float32)
-                ref_2d     = np.array([kp.pt   for kp in reference_kp], dtype=np.float32)
-                ref_2d    -= ref_2d.mean(axis=0)
-                init_obj3d = np.column_stack(
-                    [ref_2d, np.zeros(len(reference_kp), dtype=np.float32)]
-                )
-
-                tracker.reset()
-                if len(init_pts) > 0:
-                    tracker.initialise(
-                        reference_gray, init_pts, init_obj3d, ref_bbox=ref_bbox
+                    last_viz = ref_viz
+                    if des is None or not kp:
+                        print(f"ID{tid} {det['cls_name']}: no SIFT points in box.")
+                        continue
+                    init_pts = np.array([[k.pt] for k in kp], dtype=np.float32)
+                    ref_2d = np.array([k.pt for k in kp], dtype=np.float32)
+                    ref_2d -= ref_2d.mean(axis=0)
+                    init_obj3d = np.column_stack(
+                        [ref_2d, np.zeros(len(kp), dtype=np.float32)]
                     )
-                    print(f"Reference captured — tracking {len(init_pts)} points.")
-                else:
-                    print("Reference captured but no points found.")
-
-                if ref_mask_saved is None:
-                    print("(YOLO found no object — SIFT uses the full image.)")
+                    tr = COMTracker()
+                    tr.initialise(ref_gray, init_pts, init_obj3d, ref_bbox=det["bbox"])
+                    active_tracks[tid] = {
+                        "tracker": tr,
+                        "ref_kp": kp,
+                        "ref_des": des,
+                        "ref_bbox": det["bbox"],
+                        "cls": det["cls_name"],
+                    }
+                    print(
+                        f"ID{tid} {det['cls_name']}: {len(kp)} SIFT pts "
+                        f"(conf={det['conf']:.2f}).",
+                    )
+                if last_viz is not None:
+                    cv2.imshow("Reference Features", last_viz)
+                if not active_tracks:
+                    print("No tracks started — no SIFT features in any detection box.")
 
             # ------ t : manual ROI --------------------------------------------
             elif key == ord("t"):
@@ -1145,32 +1365,42 @@ def main():
                 cv2.destroyWindow("Select ROI")
 
                 if rw > 0 and rh > 0:
-                    ref_color      = roi_frame
-                    reference_gray = cv2.cvtColor(ref_color, cv2.COLOR_BGR2GRAY)
-                    ref_bbox       = (rx, ry, rx + rw, ry + rh)
+                    ref_color = roi_frame
+                    ref_gray = cv2.cvtColor(ref_color, cv2.COLOR_BGR2GRAY)
+                    ref_bbox = (rx, ry, rx + rw, ry + rh)
 
-                    ref_mask_saved = np.zeros(reference_gray.shape, dtype=np.uint8)
-                    ref_mask_saved[ry:ry + rh, rx:rx + rw] = 255
+                    ref_mask_saved = np.zeros(ref_gray.shape, dtype=np.uint8)
+                    ref_mask_saved[ry : ry + rh, rx : rx + rw] = 255
 
-                    reference_kp, reference_des, ref_viz = compute_reference_features(
-                        reference_gray, ref_color, ref_mask_saved, ref_bbox,
+                    ref_kp, ref_des, ref_viz = compute_reference_features(
+                        ref_gray, ref_color, ref_mask_saved, ref_bbox,
                         max_features_holder[0],
                     )
                     cv2.imshow("Reference Features", ref_viz)
 
-                    init_pts   = np.array([[kp.pt] for kp in reference_kp], dtype=np.float32)
-                    ref_2d     = np.array([kp.pt   for kp in reference_kp], dtype=np.float32)
-                    ref_2d    -= ref_2d.mean(axis=0)
+                    init_pts = np.array([[kp.pt] for kp in ref_kp], dtype=np.float32)
+                    ref_2d = np.array([kp.pt for kp in ref_kp], dtype=np.float32)
+                    ref_2d -= ref_2d.mean(axis=0)
                     init_obj3d = np.column_stack(
-                        [ref_2d, np.zeros(len(reference_kp), dtype=np.float32)]
+                        [ref_2d, np.zeros(len(ref_kp), dtype=np.float32)]
                     )
 
-                    tracker.reset()
+                    tid = next_track_id[0]
+                    next_track_id[0] += 1
+                    active_tracks.clear()
+                    track_bbox_memory.clear()
+                    track_bbox_memory[tid] = ref_bbox
+                    tr = COMTracker()
                     if len(init_pts) > 0:
-                        tracker.initialise(
-                            reference_gray, init_pts, init_obj3d, ref_bbox=ref_bbox
-                        )
-                        print(f"Manual ROI — tracking {len(init_pts)} points.")
+                        tr.initialise(ref_gray, init_pts, init_obj3d, ref_bbox=ref_bbox)
+                        active_tracks[tid] = {
+                            "tracker": tr,
+                            "ref_kp": ref_kp,
+                            "ref_des": ref_des,
+                            "ref_bbox": ref_bbox,
+                            "cls": "ROI",
+                        }
+                        print(f"Manual ROI — ID{tid}, tracking {len(init_pts)} points.")
                     else:
                         print("ROI selected but no SIFT points found inside it.")
                 else:
