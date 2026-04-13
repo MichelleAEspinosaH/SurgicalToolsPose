@@ -620,33 +620,28 @@ def run_live_camera(args, predictor) -> None:
 
     writer = _make_writer(args)
     axis_states: dict[int, dict | None] = {}
-    frame_idx = 0
 
+    # Run propagate_in_video as a single long-running generator.
+    # provider.__getitem__(N) blocks until frame N is captured, so the
+    # generator naturally paces itself to the camera — no manual frame
+    # counting needed.
     print("Live tracking started. Press 'q' or ESC to stop.")
-    while not stop_flag.is_set():
-        # Wait for the next frame to be captured
-        while len(provider) <= frame_idx and not stop_flag.is_set():
-            time.sleep(0.001)
-        if stop_flag.is_set():
-            break
-
-        for fi, obj_ids, masks in predictor.propagate_in_video(
-            state, start_frame_idx=frame_idx, max_frame_num_to_track=1
-        ):
+    try:
+        for fi, obj_ids, masks in predictor.propagate_in_video(state):
             _render_frame(fi, obj_ids, masks, provider.get_raw(fi),
                           axis_states, args, writer,
                           seed_points=points if fi == 0 else None)
-
-        frame_idx += 1
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27):
-            break
-
-    stop_flag.set()
-    cap.release()
-    if writer is not None:
-        writer.release()
-    cv2.destroyAllWindows()
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            if stop_flag.is_set():
+                break
+    finally:
+        stop_flag.set()
+        cap.release()
+        if writer is not None:
+            writer.release()
+        cv2.destroyAllWindows()
 
 
 # ---------------------------------------------------------------------------
