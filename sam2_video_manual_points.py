@@ -200,6 +200,12 @@ def _mask_to_2d_bool(m: np.ndarray, fh: int, fw: int) -> np.ndarray:
         return np.zeros((fh, fw), dtype=bool)
     if x.shape[0] != fh or x.shape[1] != fw:
         x = cv2.resize(x, (fw, fh), interpolation=cv2.INTER_NEAREST)
+    # Image predictor usually returns probabilities [0,1], video predictor often logits.
+    # Use an appropriate binarization rule for each representation.
+    xmin = float(np.min(x))
+    xmax = float(np.max(x))
+    if xmin >= 0.0 and xmax <= 1.0:
+        return x > 0.5
     return x > 0.0
 
 
@@ -901,8 +907,15 @@ def main():
             return
     cur_idx = -1
     axis_states: dict[int, dict | None] = {}
-    # SAM2ImagePredictor memory (per-object logits from previous frame).
-    prev_logits: dict[int, np.ndarray] = {}
+    # SAM2ImagePredictor per-object memory keyed by manual ID.
+    object_memories: dict[int, dict[str, np.ndarray | None]] = {
+        int(obj_id): {
+            "points": np.array([[x, y]], dtype=np.float32),
+            "mask": None,
+            "logits": None,
+        }
+        for obj_id, x, y in points
+    }
 
     if use_video_predictor:
         pred_iter = predictor.propagate_in_video(state)
@@ -941,25 +954,35 @@ def main():
             with torch.inference_mode():
                 with amp_ctx:
                     predictor.set_image(frame_rgb)
-                    for obj_id, x, y in points:
-                        oid = int(obj_id)
-                        if oid in prev_logits:
+                    for oid, mem in object_memories.items():
+                        pts = mem["points"]
+                        had_mask = mem["mask"] is not None
+                        logits_in = mem["logits"]
+                        if logits_in is not None:
+                            logits_in = np.asarray(logits_in, dtype=np.float32)
+                        if not had_mask:
+                            # First frame for this object: initialize from manual point(s).
+                            point_labels = np.ones(len(pts), dtype=np.int32)
                             masks_np, scores, logits = predictor.predict(
-                                point_coords=None,
-                                point_labels=None,
-                                mask_input=prev_logits[oid],
+                                point_coords=pts,
+                                point_labels=point_labels,
+                                mask_input=logits_in,
                                 multimask_output=False,
                             )
                         else:
+                            # Subsequent frames: keep point anchors to preserve object identity,
+                            # while using previous logits as temporal memory.
+                            point_labels = np.ones(len(pts), dtype=np.int32)
                             masks_np, scores, logits = predictor.predict(
-                                point_coords=np.array([[x, y]], dtype=np.float32),
-                                point_labels=np.array([1], dtype=np.int32),
-                                mask_input=None,
+                                point_coords=pts,
+                                point_labels=point_labels,
+                                mask_input=logits_in,
                                 multimask_output=False,
                             )
-                        prev_logits[oid] = logits
-                        obj_ids_list.append(oid)
-                        masks_list.append(masks_np[0].astype(np.float32))
+                        mem["logits"] = logits
+                        mem["mask"] = masks_np[0].astype(np.float32)
+                        obj_ids_list.append(int(oid))
+                        masks_list.append(mem["mask"])
             if not masks_list:
                 frame_idx += 1
                 continue
