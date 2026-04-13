@@ -108,6 +108,186 @@ def overlay_masks_with_ids(
     return vis.astype(np.uint8)
 
 
+def _resample_contour_xy(mask_bool: np.ndarray, num_pts: int) -> np.ndarray | None:
+    """Ordered boundary samples for Procrustes (same index = same arc-length fraction)."""
+    m = (mask_bool.astype(np.uint8) * 255)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return None
+    cnt = max(cnts, key=cv2.contourArea)
+    if len(cnt) < 3:
+        return None
+    pts = cnt.reshape(-1, 2).astype(np.float64)
+    closed = np.vstack([pts, pts[0:1]])
+    seg = np.sqrt(np.sum(np.diff(closed, axis=0) ** 2, axis=1))
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if total < 1e-6:
+        return None
+    targets = np.linspace(0.0, total, num_pts, endpoint=False)
+    out = np.empty((num_pts, 2), dtype=np.float64)
+    for j, t in enumerate(targets):
+        k = int(np.searchsorted(cum, t, side="right") - 1)
+        k = np.clip(k, 0, len(pts) - 1)
+        out[j] = pts[k]
+    return out
+
+
+def _mask_pca_axes_2d(
+    mask_bool: np.ndarray,
+    max_samples: int = 8000,
+    axis_len_scale: float = 2.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float] | None:
+    """Centroid + major/minor axis unit vectors + display half-lengths from pixel covariance."""
+    ys, xs = np.where(mask_bool)
+    n = len(xs)
+    if n < 12:
+        return None
+    rng = np.random.default_rng(0)
+    if n > max_samples:
+        sel = rng.choice(n, size=max_samples, replace=False)
+        xs, ys = xs[sel], ys[sel]
+    P = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+    c = P.mean(axis=0)
+    Pc = P - c
+    cov = (Pc.T @ Pc) / max(len(Pc), 1)
+    w, V = np.linalg.eigh(cov)
+    order = np.argsort(w)
+    v_minor = V[:, order[0]]
+    v_major = V[:, order[-1]]
+    # half-lengths in pixels (stabilized)
+    lam_maj = float(max(w[order[-1]], 1e-8))
+    lam_min = float(max(w[order[0]], 1e-8))
+    half_major = axis_len_scale * np.sqrt(lam_maj)
+    half_minor = axis_len_scale * np.sqrt(lam_min)
+    half_major = float(np.clip(half_major, 20.0, 400.0))
+    half_minor = float(np.clip(half_minor, 15.0, 300.0))
+    return c, v_major / (np.linalg.norm(v_major) + 1e-12), v_minor / (np.linalg.norm(v_minor) + 1e-12), half_major, half_minor
+
+
+def _kabsch_rigid_rows_2d(P: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Row-vector rigid transform: Q ≈ P @ R.T + t (least squares).
+    P, Q: (n, 2)
+    """
+    mu_p = P.mean(axis=0)
+    mu_q = Q.mean(axis=0)
+    Pc = P - mu_p
+    Qc = Q - mu_q
+    H = Pc.T @ Qc
+    U, _, Vt = np.linalg.svd(H)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        Vt = Vt.copy()
+        Vt[1, :] *= -1.0
+        R = U @ Vt
+    t = mu_q - mu_p @ R.T
+    return R.astype(np.float64), t.astype(np.float64)
+
+
+def _icp_2d(
+    P: np.ndarray,
+    Q: np.ndarray,
+    max_iter: int = 25,
+    tol: float = 1e-5,
+) -> np.ndarray:
+    """
+    Iterative Closest Point in 2D: align source P to target Q.
+    P, Q: (n,2) and (m,2); returns R (2,2) such that PCA axes rotate as u' = R @ u.
+    Uses row convention P_warped = P @ R.T + t each step; accumulates R_acc, t_acc with
+    R_acc <- Ri @ R_acc, t_acc <- t_acc @ Ri.T + ti.
+    """
+    if P.shape[0] < 3 or Q.shape[0] < 3:
+        return np.eye(2, dtype=np.float64)
+    R_acc = np.eye(2, dtype=np.float64)
+    t_acc = np.zeros(2, dtype=np.float64)
+    prev_err = np.inf
+    for _ in range(max_iter):
+        P_t = (P @ R_acc.T) + t_acc
+        diff = P_t[:, None, :] - Q[None, :, :]
+        d2 = np.sum(diff * diff, axis=2)
+        idx = np.argmin(d2, axis=1)
+        Q_near = Q[idx]
+        Ri, ti = _kabsch_rigid_rows_2d(P_t, Q_near)
+        R_acc = Ri @ R_acc
+        t_acc = t_acc @ Ri.T + ti
+        err = float(np.mean(np.sum((P_t - Q_near) ** 2, axis=1)))
+        if prev_err < np.inf and abs(prev_err - err) < tol:
+            break
+        prev_err = err
+    return R_acc
+
+
+def draw_object_axes_icp(
+    vis: np.ndarray,
+    mask_bool: np.ndarray,
+    obj_id: int,
+    state: dict | None,
+    contour_pts: int,
+    icp_iter: int,
+) -> dict | None:
+    """
+    Define PCA axes on first good mask; each frame align reference contour to the
+    current contour via ICP (closest-point + Kabsch) and draw rotated axes at the
+    current contour centroid.
+    """
+    fh, fw = vis.shape[:2]
+    if not np.any(mask_bool):
+        return state
+    ctr = _resample_contour_xy(mask_bool, contour_pts)
+    if ctr is None:
+        return state
+    c_cur = ctr.mean(axis=0)
+    X_cur = ctr - c_cur
+
+    col = point_color(int(obj_id))
+    if state is None:
+        pca = _mask_pca_axes_2d(mask_bool)
+        if pca is None:
+            return None
+        _, u1, u2, h1, h2 = pca
+        state = {
+            "ref_contour_centered": ctr - c_cur,
+            "u1": u1.astype(np.float64),
+            "u2": u2.astype(np.float64),
+            "h1": h1,
+            "h2": h2,
+        }
+        R = np.eye(2, dtype=np.float64)
+    else:
+        X_ref = state["ref_contour_centered"]
+        if X_ref.shape[0] != X_cur.shape[0]:
+            return state
+        R = _icp_2d(X_ref, X_cur, max_iter=icp_iter)
+
+    u1t = R @ state["u1"]
+    u2t = R @ state["u2"]
+    u1t = u1t / (np.linalg.norm(u1t) + 1e-12)
+    u2t = u2t / (np.linalg.norm(u2t) + 1e-12)
+
+    cx, cy = float(c_cur[0]), float(c_cur[1])
+    h1, h2 = state["h1"], state["h2"]
+
+    def _seg(p0, p1):
+        p0 = (int(np.clip(p0[0], 0, fw - 1)), int(np.clip(p0[1], 0, fh - 1)))
+        p1 = (int(np.clip(p1[0], 0, fw - 1)), int(np.clip(p1[1], 0, fh - 1)))
+        cv2.arrowedLine(vis, p0, p1, col, 2, tipLength=0.2)
+
+    c = np.array([cx, cy], dtype=np.float64)
+    _seg(c - u1t * h1, c + u1t * h1)
+    _seg(c - u2t * h2, c + u2t * h2)
+    cv2.putText(
+        vis,
+        f"ID{obj_id} axes",
+        (int(cx) + 10, int(cy) - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        col,
+        1,
+    )
+    return state
+
+
 def resolve_model_paths(repo_root: Path, model_size: str) -> tuple[str, str]:
     model_size = model_size.lower()
     if model_size == "tiny":
@@ -192,6 +372,23 @@ def main():
     )
     parser.add_argument("--alpha", type=float, default=0.45, help="Mask overlay alpha")
     parser.add_argument("--output", default="", help="Optional output video path")
+    parser.add_argument(
+        "--contour-pts",
+        type=int,
+        default=96,
+        help="Resampled contour points for ICP alignment",
+    )
+    parser.add_argument(
+        "--icp-iter",
+        type=int,
+        default=25,
+        help="Max ICP iterations per frame (closest point + Kabsch)",
+    )
+    parser.add_argument(
+        "--no-axes",
+        action="store_true",
+        help="Disable ICP / PCA axis overlay",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -253,6 +450,7 @@ def main():
     cap.release()
     cap = cv2.VideoCapture(args.input)
     cur_idx = -1
+    axis_states: dict[int, dict | None] = {}
 
     for frame_idx, obj_ids, masks in predictor.propagate_in_video(state):
         while cur_idx < frame_idx:
@@ -269,6 +467,21 @@ def main():
         else:
             obj_ids_list = [int(i) for i in obj_ids]
         vis = overlay_masks_with_ids(frame, obj_ids_list, masks, alpha=args.alpha)
+        if not args.no_axes:
+            fh, fw = frame.shape[:2]
+            masks_np = masks.detach().cpu().numpy()
+            n_m = min(len(obj_ids_list), masks_np.shape[0])
+            for i in range(n_m):
+                oid = int(obj_ids_list[i])
+                binm = _mask_to_2d_bool(masks_np[i], fh, fw)
+                axis_states[oid] = draw_object_axes_icp(
+                    vis,
+                    binm,
+                    oid,
+                    axis_states.get(oid),
+                    contour_pts=max(12, args.contour_pts),
+                    icp_iter=max(3, args.icp_iter),
+                )
         if frame_idx == 0:
             for obj_id, px_f, py_f in points:
                 px, py = int(px_f), int(py_f)

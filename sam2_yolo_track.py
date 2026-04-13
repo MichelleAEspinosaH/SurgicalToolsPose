@@ -22,7 +22,9 @@ from ultralytics.models.sam import SAM2DynamicInteractivePredictor
 YoloResults = Any
 
 
-def _boxes_xyxy_from_yolo_result(r, names: dict, excluded: set[str]) -> list[list[float]]:
+def _boxes_with_indices_from_yolo_result(
+    r, names: dict, excluded: set[str]
+) -> list[tuple[int, list[float]]]:
     if r.boxes is None or len(r.boxes) == 0:
         return []
     boxes = r.boxes
@@ -33,7 +35,7 @@ def _boxes_xyxy_from_yolo_result(r, names: dict, excluded: set[str]) -> list[lis
         if label in excluded:
             continue
         x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy().tolist()
-        out.append([float(x1), float(y1), float(x2), float(y2)])
+        out.append((i, [float(x1), float(y1), float(x2), float(y2)]))
     return out
 
 
@@ -132,13 +134,34 @@ class SamYoloVideoTracker:
         self,
         frame_bgr: np.ndarray,
         yolo_r: YoloResults,
+        sift_points_by_yolo_idx: dict[int, tuple[float, float]] | None = None,
     ) -> tuple[np.ndarray, list[Any] | None]:
         assert self._yolo is not None and self._sam is not None
         yolo_vis = yolo_r.plot()
-        bboxes = _boxes_xyxy_from_yolo_result(
+        indexed_boxes = _boxes_with_indices_from_yolo_result(
             yolo_r, self._yolo.names, self.excluded_classes
         )
-        n = len(bboxes)
+        bboxes = [b for _, b in indexed_boxes]
+        # If caller provides this dict, run strict point-only prompting path (never bbox fallback).
+        use_point_only = sift_points_by_yolo_idx is not None
+        point_prompts: list[list[float]] = []
+        point_labels: list[int] = []
+        point_obj_ids: list[int] = []
+        if use_point_only:
+            # Keep prompt order stable by YOLO index.
+            kept = sorted(
+                [
+                    (yidx, sift_points_by_yolo_idx[yidx])
+                    for yidx, _ in indexed_boxes
+                    if yidx in sift_points_by_yolo_idx
+                ],
+                key=lambda t: t[0],
+            )
+            for oi, (_, p) in enumerate(kept):
+                point_prompts.append([float(p[0]), float(p[1])])
+                point_labels.append(1)
+                point_obj_ids.append(oi)
+        n = len(point_prompts) if use_point_only else len(bboxes)
         sam_out = None
 
         if n == 0:
@@ -156,12 +179,23 @@ class SamYoloVideoTracker:
         )
 
         if need_reseed:
-            sam_out = self._sam(
-                source=frame_bgr,
-                bboxes=bboxes,
-                obj_ids=obj_ids,
-                update_memory=True,
-            )
+            if use_point_only:
+                # Point-only prompting path: intentionally do not pass bboxes.
+                call_kwargs = dict(
+                    source=frame_bgr,
+                    points=point_prompts,
+                    labels=point_labels,
+                    obj_ids=point_obj_ids,
+                    update_memory=True,
+                )
+            else:
+                call_kwargs = dict(
+                    source=frame_bgr,
+                    bboxes=bboxes,
+                    obj_ids=obj_ids,
+                    update_memory=True,
+                )
+            sam_out = self._sam(**call_kwargs)
             self._prev_n = n
         else:
             sam_out = self._sam(source=frame_bgr)
@@ -176,11 +210,16 @@ class SamYoloVideoTracker:
         return self._sam_step(frame_bgr, yolo_r)
 
     def step_with_yolo_result(
-        self, frame_bgr: np.ndarray, yolo_r: YoloResults
+        self,
+        frame_bgr: np.ndarray,
+        yolo_r: YoloResults,
+        sift_points_by_yolo_idx: dict[int, tuple[float, float]] | None = None,
     ) -> list[Any] | None:
         """
         Use an existing ultralytics Results object (same frame). Returns SAM
         results only, or None if no boxes / SAM skipped.
         """
-        _, sam_out = self._sam_step(frame_bgr, yolo_r)
+        _, sam_out = self._sam_step(
+            frame_bgr, yolo_r, sift_points_by_yolo_idx=sift_points_by_yolo_idx
+        )
         return sam_out

@@ -392,6 +392,36 @@ def point_color(idx, hue_base: int = 0):
     return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
 
 
+def overlay_binary_mask(image, mask, color, alpha: float = 0.3):
+    """Blend a binary mask onto image with given BGR color."""
+    if mask is None:
+        return image
+    binm = mask > 0
+    if not np.any(binm):
+        return image
+    out = image.copy().astype(np.float32)
+    col = np.array(color, dtype=np.float32)
+    out[binm] = out[binm] * (1.0 - alpha) + col * alpha
+    return out.astype(np.uint8)
+
+
+def select_sift_prompt_points_in_detections(gray, dets):
+    """
+    YOLO -> SIFT-in-box stage: pick one strong SIFT keypoint per detection mask.
+    Returns dict[yolo_idx] = (x, y).
+    """
+    sift = cv2.SIFT_create()
+    out = {}
+    for det in dets:
+        kp, des = sift.detectAndCompute(gray, det["mask"])
+        if not kp or des is None:
+            continue
+        # Highest-response keypoint is typically stable as a point prompt.
+        best = max(kp, key=lambda k: float(k.response))
+        out[int(det["yolo_idx"])] = (float(best.pt[0]), float(best.pt[1]))
+    return out
+
+
 # ==============================================================================
 # 3-D reconstruction helpers  (NEW in v3)
 # ==============================================================================
@@ -1125,10 +1155,52 @@ def main():
             )
 
             if sam2_tracker is not None:
-                sam2_out = sam2_tracker.step_with_yolo_result(color_image, results)
+                gray_now = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                # Strict pipeline: YOLO detections -> SIFT inside each bbox mask -> one point/object for SAM2.
+                sam_prompt_points = select_sift_prompt_points_in_detections(gray_now, dets)
+                sam2_out = sam2_tracker.step_with_yolo_result(
+                    color_image,
+                    results,
+                    sift_points_by_yolo_idx=sam_prompt_points,
+                )
+                rgb_vis = color_image.copy()
                 if sam2_out is not None:
                     svis = overlay_sam_on_bgr(color_image, sam2_out, alpha=0.45)
+                    # Visualize the exact positive point prompts sent to SAM2.
+                    for det in dets:
+                        yidx = int(det["yolo_idx"])
+                        if yidx not in sam_prompt_points:
+                            continue
+                        px, py = sam_prompt_points[yidx]
+                        tid = int(det["track_id"])
+                        c = point_color(tid, hue_base=(tid * 29) % 180)
+                        p = (int(px), int(py))
+                        cv2.circle(svis, p, 5, c, -1)
+                        cv2.circle(svis, p, 8, (255, 255, 255), 1)
+                        cv2.putText(
+                            svis,
+                            f"ID{tid} SIFT->SAM2",
+                            (p[0] + 8, p[1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            c,
+                            1,
+                        )
+                        cv2.circle(rgb_vis, p, 5, c, -1)
+                        cv2.circle(rgb_vis, p, 8, (255, 255, 255), 1)
+                        cv2.putText(
+                            rgb_vis,
+                            f"ID{tid} SIFT",
+                            (p[0] + 8, p[1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            c,
+                            1,
+                        )
                     cv2.imshow("SAM2 track", svis)
+                cv2.imshow("RGB Camera", rgb_vis)
+            else:
+                sam2_out = None
 
             # ------------------------------------------------------------------
             # Idle: YOLO plot + full-frame SIFT + persistent track IDs
@@ -1138,6 +1210,12 @@ def main():
                 for det in dets:
                     x1, y1, x2, y2 = det["bbox"]
                     tid = det["track_id"]
+                    det_vis = overlay_binary_mask(
+                        det_vis,
+                        det["mask"],
+                        point_color(tid, hue_base=(tid * 29) % 180),
+                        alpha=0.22,
+                    )
                     lab = f"ID{tid} {det['cls_name']}"
                     cv2.putText(
                         det_vis,
@@ -1236,6 +1314,17 @@ def main():
                         )
 
                 tracking_image = color_image.copy()
+                if sam2_out is not None:
+                    tracking_image = overlay_sam_on_bgr(tracking_image, sam2_out, alpha=0.25)
+                else:
+                    for det in dets:
+                        tid = det["track_id"]
+                        tracking_image = overlay_binary_mask(
+                            tracking_image,
+                            det["mask"],
+                            point_color(tid, hue_base=(tid * 29) % 180),
+                            alpha=0.20,
+                        )
                 for row, tid in enumerate(sorted_tids):
                     st = active_tracks[tid]
                     tr = st["tracker"]
