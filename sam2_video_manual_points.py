@@ -9,10 +9,23 @@ import cv2
 import numpy as np
 import torch
 from sam2.build_sam import build_sam2_video_predictor
+try:
+    from scipy.spatial import cKDTree
+except Exception:
+    cKDTree = None
+
+
+TARGET_SIZE = (640, 360)
+AXIS_LEN_PX = 40.0
 
 
 def rotate_frame_180(frame: np.ndarray) -> np.ndarray:
     return cv2.rotate(frame, cv2.ROTATE_180)
+
+
+def preprocess_frame(frame: np.ndarray) -> np.ndarray:
+    frame = rotate_frame_180(frame)
+    return cv2.resize(frame, TARGET_SIZE, interpolation=cv2.INTER_AREA)
 
 
 def pick_points(first_frame: np.ndarray) -> list[tuple[int, float, float]]:
@@ -112,6 +125,190 @@ def overlay_masks_with_ids(
     return vis.astype(np.uint8)
 
 
+def _resample_contour_xy(mask_bool: np.ndarray, num_pts: int) -> np.ndarray | None:
+    m = (mask_bool.astype(np.uint8) * 255)
+    cnts, _ = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return None
+    pts_all = []
+    w_all = []
+    for c in cnts:
+        if len(c) < 5:
+            continue
+        p = c.reshape(-1, 2).astype(np.float64)
+        prev = np.roll(p, 1, axis=0)
+        nxt = np.roll(p, -1, axis=0)
+        v1 = p - prev
+        v2 = nxt - p
+        n1 = np.linalg.norm(v1, axis=1) + 1e-9
+        n2 = np.linalg.norm(v2, axis=1) + 1e-9
+        cosang = np.sum(v1 * v2, axis=1) / (n1 * n2)
+        cosang = np.clip(cosang, -1.0, 1.0)
+        curv = np.arccos(cosang)
+        w = 1.0 + 3.0 * (curv / np.pi)
+        pts_all.append(p)
+        w_all.append(w)
+    if not pts_all:
+        return None
+    pts = np.vstack(pts_all)
+    w = np.concatenate(w_all)
+    if len(pts) <= num_pts:
+        return pts
+    prob = w / (np.sum(w) + 1e-12)
+    rng = np.random.default_rng(0)
+    idx = rng.choice(len(pts), size=num_pts, replace=False, p=prob)
+    return pts[idx]
+
+
+def _mask_pca_axes_2d(mask_bool: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    ys, xs = np.where(mask_bool)
+    if len(xs) < 12:
+        return None
+    p = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+    c = p.mean(axis=0)
+    pc = p - c
+    cov = (pc.T @ pc) / max(len(pc), 1)
+    w, v = np.linalg.eigh(cov)
+    order = np.argsort(w)
+    u2 = v[:, order[0]]
+    u1 = v[:, order[-1]]
+    u1 = u1 / (np.linalg.norm(u1) + 1e-12)
+    u2 = u2 / (np.linalg.norm(u2) + 1e-12)
+    return c, u1, u2
+
+
+def _kabsch_rigid_rows_2d(P: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mu_p = P.mean(axis=0)
+    mu_q = Q.mean(axis=0)
+    pc = P - mu_p
+    qc = Q - mu_q
+    h = pc.T @ qc
+    u, _, vt = np.linalg.svd(h)
+    r = u @ vt
+    if np.linalg.det(r) < 0:
+        vt = vt.copy()
+        vt[1, :] *= -1.0
+        r = u @ vt
+    t = mu_q - mu_p @ r.T
+    return r.astype(np.float64), t.astype(np.float64)
+
+
+def _icp_2d(
+    P: np.ndarray,
+    Q: np.ndarray,
+    prev_R: np.ndarray | None = None,
+    prev_t: np.ndarray | None = None,
+    max_iter: int = 20,
+    tol: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray]:
+    if P.shape[0] < 3 or Q.shape[0] < 3:
+        return np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64)
+    r_acc = prev_R.copy() if prev_R is not None else np.eye(2, dtype=np.float64)
+    if prev_t is not None:
+        t_acc = prev_t.copy()
+    else:
+        t_acc = Q.mean(axis=0) - (P @ r_acc.T).mean(axis=0)
+    prev_err = np.inf
+    tree = cKDTree(Q) if cKDTree is not None else None
+    for _ in range(max_iter):
+        p_t = (P @ r_acc.T) + t_acc
+        if tree is not None:
+            dist, idx = tree.query(p_t)
+            q_near = Q[idx]
+            err = float(np.mean(dist * dist))
+        else:
+            diff = p_t[:, None, :] - Q[None, :, :]
+            d2 = np.sum(diff * diff, axis=2)
+            idx = np.argmin(d2, axis=1)
+            q_near = Q[idx]
+            err = float(np.mean(np.min(d2, axis=1)))
+        ri, ti = _kabsch_rigid_rows_2d(p_t, q_near)
+        r_acc = ri @ r_acc
+        t_acc = t_acc @ ri.T + ti
+        if prev_err < np.inf and abs(prev_err - err) < tol:
+            break
+        prev_err = err
+    return r_acc, t_acc
+
+
+def draw_object_axes_icp(
+    vis: np.ndarray,
+    mask_bool: np.ndarray,
+    obj_id: int,
+    state: dict | None,
+    contour_pts: int = 300,
+) -> dict | None:
+    fh, fw = vis.shape[:2]
+    if not np.any(mask_bool):
+        return state
+    m = (mask_bool.astype(np.uint8) * 255)
+    m = cv2.erode(m, np.ones((3, 3), np.uint8), iterations=1)
+    clean_mask = m > 0
+    ctr = _resample_contour_xy(clean_mask, contour_pts)
+    if ctr is None:
+        return state
+    c_cur = ctr.mean(axis=0)
+    x_cur = ctr - c_cur
+
+    if state is None:
+        pca = _mask_pca_axes_2d(clean_mask)
+        if pca is None:
+            return None
+        _, u1, u2 = pca
+        state = {
+            "ref_contour_centered": ctr - c_cur,
+            "u1": u1.astype(np.float64),
+            "u2": u2.astype(np.float64),
+            "prev_R": np.eye(2, dtype=np.float64),
+            "prev_t": np.zeros(2, dtype=np.float64),
+        }
+        r = np.eye(2, dtype=np.float64)
+    else:
+        x_ref = state["ref_contour_centered"]
+        if x_ref.shape[0] != x_cur.shape[0]:
+            return state
+        r, t = _icp_2d(
+            x_ref,
+            x_cur,
+            prev_R=state.get("prev_R"),
+            prev_t=state.get("prev_t"),
+        )
+        state["prev_R"] = r
+        state["prev_t"] = t
+
+    u1t = r @ state["u1"]
+    u2t = r @ state["u2"]
+    u1t = u1t / (np.linalg.norm(u1t) + 1e-12)
+    u2t = u2t / (np.linalg.norm(u2t) + 1e-12)
+    u3t = u1t + u2t
+    if np.linalg.norm(u3t) < 1e-6:
+        u3t = np.array([1.0, 0.0], dtype=np.float64)
+    u3t = u3t / (np.linalg.norm(u3t) + 1e-12)
+
+    c = np.array([float(c_cur[0]), float(c_cur[1])], dtype=np.float64)
+    axes = [
+        (u1t, (0, 0, 255), "X"),
+        (u2t, (0, 255, 0), "Y"),
+        (u3t, (255, 0, 0), "Z"),
+    ]
+    for u, col, label in axes:
+        p0 = c - u * AXIS_LEN_PX
+        p1 = c + u * AXIS_LEN_PX
+        p0 = (int(np.clip(p0[0], 0, fw - 1)), int(np.clip(p0[1], 0, fh - 1)))
+        p1 = (int(np.clip(p1[0], 0, fw - 1)), int(np.clip(p1[1], 0, fh - 1)))
+        cv2.line(vis, p0, p1, col, 2, lineType=cv2.LINE_AA)
+        cv2.putText(
+            vis,
+            f"{label}{obj_id}",
+            (p1[0] + 3, p1[1] + 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            col,
+            1,
+        )
+    return state
+
+
 def resolve_model_paths(repo_root: Path, model_size: str) -> tuple[str, str]:
     model_size = model_size.lower()
     if model_size == "tiny":
@@ -162,7 +359,7 @@ def prepare_sam2_input_as_jpeg_folder(input_path: str) -> tuple[str, str]:
         ok, frame = cap.read()
         if not ok:
             break
-        frame = rotate_frame_180(frame)
+        frame = preprocess_frame(frame)
         out_path = os.path.join(tmp_dir, f"{frame_i:06d}.jpg")
         cv2.imwrite(out_path, frame)
         frame_i += 1
@@ -214,7 +411,7 @@ def main():
         print("Could not read first frame.")
         cap.release()
         return
-    first = rotate_frame_180(first)
+    first = preprocess_frame(first)
 
     points = pick_points(first)
     if not points:
@@ -249,7 +446,7 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS)
     if not fps or fps <= 0:
         fps = 30.0
-    h, w = first.shape[:2]
+    h, w = TARGET_SIZE[1], TARGET_SIZE[0]
     writer = None
     if args.output:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -259,6 +456,7 @@ def main():
     cap.release()
     cap = cv2.VideoCapture(args.input)
     cur_idx = -1
+    axis_states: dict[int, dict | None] = {}
 
     for frame_idx, obj_ids, masks in predictor.propagate_in_video(state):
         while cur_idx < frame_idx:
@@ -266,7 +464,7 @@ def main():
             if not ok:
                 frame = None
                 break
-            frame = rotate_frame_180(frame)
+            frame = preprocess_frame(frame)
             cur_idx += 1
         if frame is None:
             break
@@ -276,6 +474,18 @@ def main():
         else:
             obj_ids_list = [int(i) for i in obj_ids]
         vis = overlay_masks_with_ids(frame, obj_ids_list, masks, alpha=args.alpha)
+        fh, fw = frame.shape[:2]
+        masks_np = masks.detach().cpu().numpy()
+        n_m = min(len(obj_ids_list), masks_np.shape[0])
+        for i in range(n_m):
+            oid = int(obj_ids_list[i])
+            binm = _mask_to_2d_bool(masks_np[i], fh, fw)
+            axis_states[oid] = draw_object_axes_icp(
+                vis,
+                binm,
+                oid,
+                axis_states.get(oid),
+            )
         if frame_idx == 0:
             for obj_id, px_f, py_f in points:
                 px, py = int(px_f), int(py_f)
