@@ -10,7 +10,6 @@ import shutil
 import cv2
 import numpy as np
 import torch
-from sam2.build_sam import build_sam2_video_predictor
 try:
     from scipy.spatial import cKDTree
 except Exception:
@@ -23,6 +22,32 @@ AXIS_LEN_PX = 40.0
 # ImageNet normalization constants (same as SAM2's load_video_frames)
 _IMG_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 _IMG_STD  = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
+
+
+def _ensure_sam2_importable(repo_hint: str) -> None:
+    candidates = [
+        Path(repo_hint).expanduser().resolve(),
+        Path("segment-anything-2").resolve(),
+        Path("EdgeTAM").resolve(),
+    ]
+    for c in candidates:
+        if c.exists() and str(c) not in os.sys.path:
+            os.sys.path.insert(0, str(c))
+
+
+def _get_sam2_builder(repo_hint: str):
+    _ensure_sam2_importable(repo_hint)
+    try:
+        from sam2.build_sam import build_sam2_video_predictor  # type: ignore
+        return build_sam2_video_predictor
+    except Exception as e:
+        raise RuntimeError(
+            "Could not import `sam2`.\n"
+            "Install or point to a valid SAM2 repo, e.g.:\n"
+            "  git clone https://github.com/facebookresearch/segment-anything-2.git\n"
+            "  .venv/bin/python -m pip install -e segment-anything-2\n"
+            "Or run with --sam2-repo /absolute/path/to/segment-anything-2"
+        ) from e
 
 
 def rotate_frame_180(frame: np.ndarray) -> np.ndarray:
@@ -652,7 +677,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Apply official Meta SAM2 video tracking from manual point prompts."
     )
-    parser.add_argument("--input", default="movie.mp4.mov",
+    parser.add_argument("--input", default="recording_rgb.mp4",
                         help="Input video path, or camera index (e.g. 0, 1) for live mode")
     parser.add_argument(
         "--sam2-repo",
@@ -690,6 +715,7 @@ def main():
 
     device = choose_device(args.device)
     print(f"Using device={device}, model={args.model_size}")
+    build_sam2_video_predictor = _get_sam2_builder(args.sam2_repo)
     predictor = build_sam2_video_predictor(model_cfg, ckpt_path, device=device)
 
     if args.compile:
