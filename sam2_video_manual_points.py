@@ -268,6 +268,7 @@ def draw_object_axes_icp(
     obj_id: int,
     state: dict | None,
     contour_pts: int = 100,
+    smooth_alpha: float = 0.0,
 ) -> dict | None:
     fh, fw = vis.shape[:2]
     if not np.any(mask_bool):
@@ -307,8 +308,30 @@ def draw_object_axes_icp(
         state["prev_R"] = r
         state["prev_t"] = t
 
-    u1t = r @ state["u1"]
-    u2t = r @ state["u2"]
+    # --- EMA smoothing on rotation angle and centroid ---
+    raw_angle = np.arctan2(r[1, 0], r[0, 0])
+    if "smoothed_angle" not in state:
+        state["smoothed_angle"] = raw_angle
+    elif smooth_alpha > 0.0:
+        da = raw_angle - state["smoothed_angle"]
+        da = (da + np.pi) % (2 * np.pi) - np.pi  # wrap to [-π, π]
+        state["smoothed_angle"] += (1.0 - smooth_alpha) * da
+    else:
+        state["smoothed_angle"] = raw_angle
+
+    a = state["smoothed_angle"]
+    r_smooth = np.array([[np.cos(a), -np.sin(a)],
+                         [np.sin(a),  np.cos(a)]], dtype=np.float64)
+
+    if "smoothed_center" not in state:
+        state["smoothed_center"] = c_cur.copy()
+    elif smooth_alpha > 0.0:
+        state["smoothed_center"] = smooth_alpha * state["smoothed_center"] + (1.0 - smooth_alpha) * c_cur
+    else:
+        state["smoothed_center"] = c_cur.copy()
+
+    u1t = r_smooth @ state["u1"]
+    u2t = r_smooth @ state["u2"]
     u1t = u1t / (np.linalg.norm(u1t) + 1e-12)
     u2t = u2t / (np.linalg.norm(u2t) + 1e-12)
     u3t = u1t + u2t
@@ -316,7 +339,7 @@ def draw_object_axes_icp(
         u3t = np.array([1.0, 0.0], dtype=np.float64)
     u3t = u3t / (np.linalg.norm(u3t) + 1e-12)
 
-    c = np.array([float(c_cur[0]), float(c_cur[1])], dtype=np.float64)
+    c = state["smoothed_center"].copy()
     axes = [
         (u1t, (0, 0, 255), "X"),
         (u2t, (0, 255, 0), "Y"),
@@ -375,27 +398,31 @@ def choose_device(device_arg: str) -> str:
     return "cpu"
 
 
-def prepare_sam2_input_as_jpeg_folder(input_path: str) -> tuple[str, str]:
+def prepare_sam2_input_as_jpeg_folder(input_path: str, frame_step: int = 1) -> tuple[str, str]:
     """
     Build a temporary JPEG frame folder for SAM2 init_state().
     This avoids the optional decord dependency required for direct video-file loading.
+    frame_step > 1 writes only every N-th source frame, proportionally reducing SAM2 work.
     """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open input video: {input_path}")
 
     tmp_dir = tempfile.mkdtemp(prefix="sam2_frames_")
-    frame_i = 0
+    src_i = 0
+    dst_i = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        frame = preprocess_frame(frame)
-        out_path = os.path.join(tmp_dir, f"{frame_i:06d}.jpg")
-        cv2.imwrite(out_path, frame)
-        frame_i += 1
+        if src_i % frame_step == 0:
+            frame = preprocess_frame(frame)
+            out_path = os.path.join(tmp_dir, f"{dst_i:06d}.jpg")
+            cv2.imwrite(out_path, frame)
+            dst_i += 1
+        src_i += 1
     cap.release()
-    if frame_i == 0:
+    if dst_i == 0:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("Input video contained no readable frames.")
     return tmp_dir, tmp_dir
@@ -465,6 +492,7 @@ def _render_frame(
     args,
     writer,
     seed_points: list | None = None,
+    smooth_alpha: float = 0.0,
 ) -> None:
     if hasattr(obj_ids, "tolist"):
         obj_ids_list = [int(x) for x in obj_ids.tolist()]
@@ -477,7 +505,7 @@ def _render_frame(
     for i in range(min(len(obj_ids_list), masks_np.shape[0])):
         oid = obj_ids_list[i]
         binm = _mask_to_2d_bool(masks_np[i], fh, fw)
-        axis_states[oid] = draw_object_axes_icp(vis, binm, oid, axis_states.get(oid))
+        axis_states[oid] = draw_object_axes_icp(vis, binm, oid, axis_states.get(oid), smooth_alpha=smooth_alpha)
 
     if seed_points and frame_idx == 0:
         for obj_id, px_f, py_f in seed_points:
@@ -534,8 +562,9 @@ def run_video(args, predictor, device: str) -> None:
         print("No points selected. Exiting.")
         return
 
-    sam2_video_path, temp_frames_dir = prepare_sam2_input_as_jpeg_folder(args.input)
-    print(f"Prepared temporary JPEG frame folder for SAM2: {sam2_video_path}")
+    frame_step = max(1, args.frame_step)
+    sam2_video_path, temp_frames_dir = prepare_sam2_input_as_jpeg_folder(args.input, frame_step=frame_step)
+    print(f"Prepared temporary JPEG frame folder for SAM2: {sam2_video_path} (frame_step={frame_step})")
     # async_loading_frames uses float64 internally, which MPS doesn't support
     use_async = (device != "mps")
     state = predictor.init_state(video_path=sam2_video_path, async_loading_frames=use_async)
@@ -553,29 +582,37 @@ def run_video(args, predictor, device: str) -> None:
     fps = cap.get(cv2.CAP_PROP_FPS)
     if not fps or fps <= 0:
         fps = 30.0
+    if frame_step > 1:
+        fps = fps / frame_step
 
     writer = _make_writer(args, fps)
     cur_idx = -1
     axis_states: dict[int, dict | None] = {}
     frame = None
 
-    for frame_idx, obj_ids, masks in predictor.propagate_in_video(state):
-        while cur_idx < frame_idx:
-            ok, frame = cap.read()
-            if not ok:
-                frame = None
+    ac_device = device.split(":")[0]
+    ac_dtype = torch.bfloat16 if ac_device == "cuda" else torch.float16
+    ac_enabled = args.half and ac_device != "cpu"
+
+    with torch.autocast(device_type=ac_device, dtype=ac_dtype, enabled=ac_enabled):
+        for frame_idx, obj_ids, masks in predictor.propagate_in_video(state):
+            # Advance source video by frame_step for each SAM2 frame
+            while cur_idx < frame_idx * frame_step:
+                ok, frame = cap.read()
+                if not ok:
+                    frame = None
+                    break
+                cur_idx += 1
+            if frame is None:
                 break
-            frame = preprocess_frame(frame)
-            cur_idx += 1
-        if frame is None:
-            break
+            display_frame = preprocess_frame(frame)
 
-        _render_frame(frame_idx, obj_ids, masks, frame, axis_states, args, writer,
-                      seed_points=points)
+            _render_frame(frame_idx, obj_ids, masks, display_frame, axis_states, args, writer,
+                          seed_points=points, smooth_alpha=args.axis_smooth)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27):
-            break
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
 
     cap.release()
     if writer is not None:
@@ -655,7 +692,8 @@ def run_live_camera(args, predictor) -> None:
         for fi, obj_ids, masks in predictor.propagate_in_video(state):
             _render_frame(fi, obj_ids, masks, provider.get_raw(fi),
                           axis_states, args, writer,
-                          seed_points=points if fi == 0 else None)
+                          seed_points=points if fi == 0 else None,
+                          smooth_alpha=args.axis_smooth)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
@@ -698,6 +736,32 @@ def main():
     )
     parser.add_argument("--alpha", type=float, default=0.45, help="Mask overlay alpha")
     parser.add_argument("--output", default="", help="Optional output video path")
+    parser.add_argument(
+        "--frame-step",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Process every N-th frame (default 1 = all frames). Higher values speed up SAM2 proportionally.",
+    )
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        default=True,
+        help="Use half-precision (bfloat16/float16) autocast during propagation for faster inference.",
+    )
+    parser.add_argument(
+        "--no-half",
+        dest="half",
+        action="store_false",
+        help="Disable half-precision autocast.",
+    )
+    parser.add_argument(
+        "--axis-smooth",
+        type=float,
+        default=0.8,
+        metavar="ALPHA",
+        help="EMA smoothing for axes (0.0=none, 0.99=very heavy, default 0.8).",
+    )
     parser.add_argument(
         "--compile",
         action="store_true",
