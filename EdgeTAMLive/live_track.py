@@ -128,6 +128,14 @@ def point_color(obj_id: int) -> tuple[int, int, int]:
     return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
 
+def point_track_color(obj_id: int, point_idx: int) -> tuple[int, int, int]:
+    # Stable per-point color so you can visually check persistence.
+    hue = (obj_id * 37 + point_idx * 17 + 20) % 180
+    hsv = np.uint8([[[hue, 240, 255]]])
+    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
+    return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+
 def _mask_to_2d_bool(m: np.ndarray, fh: int, fw: int) -> np.ndarray:
     x = np.squeeze(np.asarray(m, dtype=np.float32))
     while x.ndim > 2:
@@ -150,6 +158,201 @@ def overlay_masks(frame, obj_ids, masks, alpha=0.45):
         c = np.array(point_color(int(obj_ids[i])), dtype=np.float32)
         vis[binm] = vis[binm] * (1 - alpha) + c * alpha
     return vis.astype(np.uint8)
+
+
+def _top_sift_keypoints_in_mask(
+    frame_bgr: np.ndarray,
+    mask_bool: np.ndarray,
+    sift: cv2.SIFT,
+    max_points: int = 10,
+) -> list[cv2.KeyPoint]:
+    mask_u8 = (mask_bool.astype(np.uint8) * 255)
+    if cv2.countNonZero(mask_u8) < 20:
+        return []
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    kps, _ = sift.detectAndCompute(gray, mask_u8)
+    if not kps:
+        return []
+
+    kps = sorted(kps, key=lambda k: float(k.response), reverse=True)
+    return kps[:max_points]
+
+
+def _sift_desc_in_mask(
+    gray: np.ndarray,
+    mask_bool: np.ndarray,
+    sift: cv2.SIFT,
+    max_kps: int = 160,
+) -> tuple[list[cv2.KeyPoint], np.ndarray | None]:
+    mask_u8 = (mask_bool.astype(np.uint8) * 255)
+    if cv2.countNonZero(mask_u8) < 20:
+        return [], None
+    kps, des = sift.detectAndCompute(gray, mask_u8)
+    if not kps or des is None:
+        return [], None
+    order = np.argsort([-float(k.response) for k in kps])
+    order = order[:max_kps]
+    kps_sel = [kps[i] for i in order]
+    des_sel = des[order]
+    return kps_sel, des_sel
+
+
+def _match_ref_to_query_points(
+    ref_des: np.ndarray | None,
+    qry_kps: list[cv2.KeyPoint],
+    qry_des: np.ndarray | None,
+    max_points: int = 10,
+    ratio_thresh: float = 0.72,
+) -> np.ndarray:
+    if ref_des is None or qry_des is None or len(ref_des) < 2 or len(qry_des) < 2:
+        return np.empty((0, 1, 2), dtype=np.float32)
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+    knn = matcher.knnMatch(ref_des, qry_des, k=2)
+    good = []
+    for pair in knn:
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance < ratio_thresh * n.distance:
+            good.append(m)
+    if not good:
+        return np.empty((0, 1, 2), dtype=np.float32)
+
+    # Keep unique query points with best distances.
+    best_by_qidx: dict[int, float] = {}
+    for m in good:
+        qidx = int(m.trainIdx)
+        d = float(m.distance)
+        prev = best_by_qidx.get(qidx)
+        if prev is None or d < prev:
+            best_by_qidx[qidx] = d
+
+    ranked = sorted(best_by_qidx.items(), key=lambda x: x[1])[:max_points]
+    pts = np.array([qry_kps[qidx].pt for qidx, _ in ranked], dtype=np.float32)
+    if pts.size == 0:
+        return np.empty((0, 1, 2), dtype=np.float32)
+    return pts.reshape(-1, 1, 2)
+
+
+def _kps_to_points(keypoints: list[cv2.KeyPoint]) -> np.ndarray:
+    if not keypoints:
+        return np.empty((0, 1, 2), dtype=np.float32)
+    pts = np.array([[kp.pt[0], kp.pt[1]] for kp in keypoints], dtype=np.float32)
+    return pts.reshape(-1, 1, 2)
+
+
+def _draw_points(vis: np.ndarray, points: np.ndarray, obj_id: int) -> None:
+    if points.size == 0:
+        return
+    pts = points.reshape(-1, 2)
+    for pidx, (x_f, y_f) in enumerate(pts):
+        x, y = int(round(float(x_f))), int(round(float(y_f)))
+        col = point_track_color(obj_id, pidx)
+        cv2.circle(vis, (x, y), 3, col, -1, lineType=cv2.LINE_AA)
+        cv2.circle(vis, (x, y), 6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+
+def _draw_3d_cube_from_mask(
+    vis: np.ndarray, mask_bool: np.ndarray, obj_id: int, state: dict | None, smooth_alpha: float = 0.8
+) -> dict | None:
+    if not np.any(mask_bool):
+        return state
+
+    # Reuse PCA/ICP orientation state so cube follows object rotation over time.
+    m = cv2.erode(mask_bool.astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
+    clean = m > 0
+    ctr = _resample_contour(clean, num_pts=100)
+    if ctr is None:
+        return state
+
+    c_cur = ctr.mean(0)
+    x_cur = ctr - c_cur
+
+    if state is None:
+        pca = _pca_axes(clean)
+        if pca is None:
+            return None
+        _, u1, u2 = pca
+        state = {
+            "ref_centered": x_cur,
+            "u1": u1.astype(np.float64),
+            "u2": u2.astype(np.float64),
+            "prev_R": np.eye(2, dtype=np.float64),
+            "prev_t": np.zeros(2, dtype=np.float64),
+        }
+        r = np.eye(2, dtype=np.float64)
+    else:
+        x_ref = state["ref_centered"]
+        if x_ref.shape[0] != x_cur.shape[0]:
+            return state
+        r, t = _icp(x_ref, x_cur, state.get("prev_R"), state.get("prev_t"))
+        state["prev_R"], state["prev_t"] = r, t
+
+    raw_angle = np.arctan2(r[1, 0], r[0, 0])
+    if "smoothed_angle" not in state:
+        state["smoothed_angle"] = raw_angle
+    elif smooth_alpha > 0.0:
+        da = (raw_angle - state["smoothed_angle"] + np.pi) % (2 * np.pi) - np.pi
+        state["smoothed_angle"] += (1.0 - smooth_alpha) * da
+    else:
+        state["smoothed_angle"] = raw_angle
+    a = state["smoothed_angle"]
+    r_s = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]], dtype=np.float64)
+
+    if "smoothed_center" not in state:
+        state["smoothed_center"] = c_cur.copy()
+    elif smooth_alpha > 0.0:
+        state["smoothed_center"] = smooth_alpha * state["smoothed_center"] + (1.0 - smooth_alpha) * c_cur
+    else:
+        state["smoothed_center"] = c_cur.copy()
+
+    c = state["smoothed_center"]
+    u1 = r_s @ state["u1"]; u1 /= np.linalg.norm(u1) + 1e-12
+    u2 = r_s @ state["u2"]; u2 /= np.linalg.norm(u2) + 1e-12
+    u3 = u1 + u2
+    if np.linalg.norm(u3) < 1e-6:
+        u3 = np.array([1.0, -1.0], dtype=np.float64)
+    u3 /= np.linalg.norm(u3) + 1e-12
+
+    # Build the front face as the minimum-area rectangle in image space.
+    ys, xs = np.where(clean)
+    if len(xs) < 20:
+        return state
+    p32 = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+    rect = cv2.minAreaRect(p32.reshape(-1, 1, 2))
+    front = cv2.boxPoints(rect).astype(np.float64)  # (4,2), minimum-area box
+    w, h = rect[1]
+    depth = max(8.0, 0.35 * min(float(w), float(h)))
+
+    # Keep corner order consistent (clockwise around centroid) for stable edge linking.
+    fc = front.mean(axis=0)
+    ang = np.arctan2(front[:, 1] - fc[1], front[:, 0] - fc[0])
+    front = front[np.argsort(ang)]
+    f0, f1, f2, f3 = front[0], front[1], front[2], front[3]
+
+    # Back face shifted along projected depth direction.
+    shift = -depth * u3
+    b0, b1, b2, b3 = f0 + shift, f1 + shift, f2 + shift, f3 + shift
+
+    def _to_i32(poly):
+        return np.array([[int(round(v[0])), int(round(v[1]))] for v in poly], dtype=np.int32)
+
+    front_i = _to_i32([f0, f1, f2, f3])
+    back_i = _to_i32([b0, b1, b2, b3])
+
+    col = point_color(obj_id)
+    col_back = (max(0, col[0] - 80), max(0, col[1] - 80), max(0, col[2] - 80))
+    cv2.polylines(vis, [back_i], True, col_back, 2, cv2.LINE_AA)
+    cv2.polylines(vis, [front_i], True, col, 2, cv2.LINE_AA)
+    for i in range(4):
+        cv2.line(vis, tuple(front_i[i]), tuple(back_i[i]), col, 2, cv2.LINE_AA)
+    cv2.putText(
+        vis, f"CUBE{obj_id}", tuple(front_i[0] + np.array([4, -4], dtype=np.int32)),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2, lineType=cv2.LINE_AA
+    )
+    return state
 
 # ---------------------------------------------------------------------------
 # ICP pose axes
@@ -437,6 +640,9 @@ def run(args):
 
     # axis_states: dict[int, dict | None] = {}
     com_trails: dict[int, list[tuple[int, int]]] = {}  # obj_id -> list of (x, y) COM positions
+    cube_states: dict[int, dict | None] = {}
+    fps_t0 = time.perf_counter()
+    fps_frames = 0
     ac_device = device.split(":")[0]
     ac_dtype = torch.bfloat16 if ac_device == "cuda" else torch.float16
     ac_enabled = args.half and ac_device != "cpu"
@@ -472,6 +678,10 @@ def run(args):
                             com_trails[oid] = []
                         com_trails[oid].append((cx, cy))
 
+                        cube_states[oid] = _draw_3d_cube_from_mask(
+                            vis, binm, oid, cube_states.get(oid), smooth_alpha=args.axis_smooth
+                        )
+
                 # Draw COM trails
                 for oid, trail in com_trails.items():
                     col = point_color(oid)
@@ -495,6 +705,13 @@ def run(args):
                     break
                 if stop_flag.is_set():
                     break
+                fps_frames += 1
+                now = time.perf_counter()
+                dt = now - fps_t0
+                if dt >= 1.0:
+                    print(f"FPS: {fps_frames / dt:.2f}")
+                    fps_t0 = now
+                    fps_frames = 0
     finally:
         stop_flag.set()
         cap.release()
