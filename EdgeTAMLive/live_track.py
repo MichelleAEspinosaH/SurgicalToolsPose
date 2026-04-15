@@ -3,7 +3,7 @@
 Real-time surgical tool tracking with EdgeTAM.
 
 Opens the Orbbec RGB camera (or any camera index), lets you click seed
-points on the first frame, then streams live masks + ICP pose axes.
+points on the first frame, then streams live masks + oriented 3D cubes.
 
 Usage:
     .venv/bin/python live_track.py                   # camera 0, default settings
@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -35,7 +36,6 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 TARGET_SIZE = (640, 360)
-AXIS_LEN_PX = 40.0
 EDGETAM_REPO = Path(__file__).parent / "EdgeTAM"
 CHECKPOINT = EDGETAM_REPO / "checkpoints" / "edgetam.pt"
 MODEL_CFG = "configs/edgetam.yaml"
@@ -53,6 +53,13 @@ def _load_predictor(device: str):
         sys.path.insert(0, repo)
     from sam2.build_sam import build_sam2_video_predictor  # type: ignore
     return build_sam2_video_predictor(MODEL_CFG, str(CHECKPOINT), device=device)
+
+
+def _autocast_config(device: str, use_half: bool) -> tuple[str, torch.dtype, bool]:
+    device_type = device.split(":")[0]
+    dtype = torch.bfloat16 if device_type == "cuda" else torch.float16
+    enabled = use_half and device_type != "cpu"
+    return device_type, dtype, enabled
 
 
 def choose_device(arg: str) -> str:
@@ -128,14 +135,6 @@ def point_color(obj_id: int) -> tuple[int, int, int]:
     return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
 
-def point_track_color(obj_id: int, point_idx: int) -> tuple[int, int, int]:
-    # Stable per-point color so you can visually check persistence.
-    hue = (obj_id * 37 + point_idx * 17 + 20) % 180
-    hsv = np.uint8([[[hue, 240, 255]]])
-    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
-    return int(bgr[0]), int(bgr[1]), int(bgr[2])
-
-
 def _mask_to_2d_bool(m: np.ndarray, fh: int, fw: int) -> np.ndarray:
     x = np.squeeze(np.asarray(m, dtype=np.float32))
     while x.ndim > 2:
@@ -160,102 +159,12 @@ def overlay_masks(frame, obj_ids, masks, alpha=0.45):
     return vis.astype(np.uint8)
 
 
-def _top_sift_keypoints_in_mask(
-    frame_bgr: np.ndarray,
-    mask_bool: np.ndarray,
-    sift: cv2.SIFT,
-    max_points: int = 10,
-) -> list[cv2.KeyPoint]:
-    mask_u8 = (mask_bool.astype(np.uint8) * 255)
-    if cv2.countNonZero(mask_u8) < 20:
-        return []
-
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    kps, _ = sift.detectAndCompute(gray, mask_u8)
-    if not kps:
-        return []
-
-    kps = sorted(kps, key=lambda k: float(k.response), reverse=True)
-    return kps[:max_points]
-
-
-def _sift_desc_in_mask(
-    gray: np.ndarray,
-    mask_bool: np.ndarray,
-    sift: cv2.SIFT,
-    max_kps: int = 160,
-) -> tuple[list[cv2.KeyPoint], np.ndarray | None]:
-    mask_u8 = (mask_bool.astype(np.uint8) * 255)
-    if cv2.countNonZero(mask_u8) < 20:
-        return [], None
-    kps, des = sift.detectAndCompute(gray, mask_u8)
-    if not kps or des is None:
-        return [], None
-    order = np.argsort([-float(k.response) for k in kps])
-    order = order[:max_kps]
-    kps_sel = [kps[i] for i in order]
-    des_sel = des[order]
-    return kps_sel, des_sel
-
-
-def _match_ref_to_query_points(
-    ref_des: np.ndarray | None,
-    qry_kps: list[cv2.KeyPoint],
-    qry_des: np.ndarray | None,
-    max_points: int = 10,
-    ratio_thresh: float = 0.72,
-) -> np.ndarray:
-    if ref_des is None or qry_des is None or len(ref_des) < 2 or len(qry_des) < 2:
-        return np.empty((0, 1, 2), dtype=np.float32)
-
-    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-    knn = matcher.knnMatch(ref_des, qry_des, k=2)
-    good = []
-    for pair in knn:
-        if len(pair) < 2:
-            continue
-        m, n = pair
-        if m.distance < ratio_thresh * n.distance:
-            good.append(m)
-    if not good:
-        return np.empty((0, 1, 2), dtype=np.float32)
-
-    # Keep unique query points with best distances.
-    best_by_qidx: dict[int, float] = {}
-    for m in good:
-        qidx = int(m.trainIdx)
-        d = float(m.distance)
-        prev = best_by_qidx.get(qidx)
-        if prev is None or d < prev:
-            best_by_qidx[qidx] = d
-
-    ranked = sorted(best_by_qidx.items(), key=lambda x: x[1])[:max_points]
-    pts = np.array([qry_kps[qidx].pt for qidx, _ in ranked], dtype=np.float32)
-    if pts.size == 0:
-        return np.empty((0, 1, 2), dtype=np.float32)
-    return pts.reshape(-1, 1, 2)
-
-
-def _kps_to_points(keypoints: list[cv2.KeyPoint]) -> np.ndarray:
-    if not keypoints:
-        return np.empty((0, 1, 2), dtype=np.float32)
-    pts = np.array([[kp.pt[0], kp.pt[1]] for kp in keypoints], dtype=np.float32)
-    return pts.reshape(-1, 1, 2)
-
-
-def _draw_points(vis: np.ndarray, points: np.ndarray, obj_id: int) -> None:
-    if points.size == 0:
-        return
-    pts = points.reshape(-1, 2)
-    for pidx, (x_f, y_f) in enumerate(pts):
-        x, y = int(round(float(x_f))), int(round(float(y_f)))
-        col = point_track_color(obj_id, pidx)
-        cv2.circle(vis, (x, y), 3, col, -1, lineType=cv2.LINE_AA)
-        cv2.circle(vis, (x, y), 6, (255, 255, 255), 1, lineType=cv2.LINE_AA)
-
-
 def _draw_3d_cube_from_mask(
-    vis: np.ndarray, mask_bool: np.ndarray, obj_id: int, state: dict | None, smooth_alpha: float = 0.8
+    vis: np.ndarray,
+    mask_bool: np.ndarray,
+    obj_id: int,
+    state: dict | None,
+    smooth_alpha: float = 0.8,
 ) -> dict | None:
     if not np.any(mask_bool):
         return state
@@ -349,8 +258,14 @@ def _draw_3d_cube_from_mask(
     for i in range(4):
         cv2.line(vis, tuple(front_i[i]), tuple(back_i[i]), col, 2, cv2.LINE_AA)
     cv2.putText(
-        vis, f"CUBE{obj_id}", tuple(front_i[0] + np.array([4, -4], dtype=np.int32)),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2, lineType=cv2.LINE_AA
+        vis,
+        f"CUBE{obj_id}",
+        tuple(front_i[0] + np.array([4, -4], dtype=np.int32)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        col,
+        2,
+        lineType=cv2.LINE_AA,
     )
     return state
 
@@ -431,77 +346,6 @@ def _icp(P, Q, prev_R=None, prev_t=None, max_iter=8, tol=1e-4):
     return r, t
 
 
-def draw_axes(vis, mask_bool, obj_id, state, contour_pts=100, smooth_alpha=0.8):
-    fh, fw = vis.shape[:2]
-    if not np.any(mask_bool):
-        return state
-    m = cv2.erode(mask_bool.astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
-    clean = m > 0
-    ctr = _resample_contour(clean, contour_pts)
-    if ctr is None:
-        return state
-    c_cur = ctr.mean(0)
-    x_cur = ctr - c_cur
-
-    if state is None:
-        pca = _pca_axes(clean)
-        if pca is None:
-            return None
-        _, u1, u2 = pca
-        state = {
-            "ref_centered": x_cur,
-            "u1": u1.astype(np.float64),
-            "u2": u2.astype(np.float64),
-            "prev_R": np.eye(2, dtype=np.float64),
-            "prev_t": np.zeros(2, dtype=np.float64),
-        }
-        r = np.eye(2, dtype=np.float64)
-    else:
-        x_ref = state["ref_centered"]
-        if x_ref.shape[0] != x_cur.shape[0]:
-            return state
-        r, t = _icp(x_ref, x_cur, state.get("prev_R"), state.get("prev_t"))
-        state["prev_R"], state["prev_t"] = r, t
-
-    # EMA smoothing on rotation angle
-    raw_angle = np.arctan2(r[1, 0], r[0, 0])
-    if "smoothed_angle" not in state:
-        state["smoothed_angle"] = raw_angle
-    elif smooth_alpha > 0.0:
-        da = (raw_angle - state["smoothed_angle"] + np.pi) % (2 * np.pi) - np.pi
-        state["smoothed_angle"] += (1.0 - smooth_alpha) * da
-    else:
-        state["smoothed_angle"] = raw_angle
-
-    a = state["smoothed_angle"]
-    r_s = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]], dtype=np.float64)
-
-    # EMA smoothing on centroid
-    if "smoothed_center" not in state:
-        state["smoothed_center"] = c_cur.copy()
-    elif smooth_alpha > 0.0:
-        state["smoothed_center"] = smooth_alpha * state["smoothed_center"] + (1 - smooth_alpha) * c_cur
-    else:
-        state["smoothed_center"] = c_cur.copy()
-
-    c = state["smoothed_center"]
-    u1t = r_s @ state["u1"]; u1t /= np.linalg.norm(u1t) + 1e-12
-    u2t = r_s @ state["u2"]; u2t /= np.linalg.norm(u2t) + 1e-12
-    u3t = u1t + u2t
-    if np.linalg.norm(u3t) < 1e-6:
-        u3t = np.array([1.0, 0.0])
-    u3t /= np.linalg.norm(u3t) + 1e-12
-
-    for u, col, lbl in [(u1t, (0, 0, 255), "X"), (u2t, (0, 255, 0), "Y"), (u3t, (255, 0, 0), "Z")]:
-        p0 = (int(np.clip(c[0] - u[0] * AXIS_LEN_PX, 0, fw - 1)),
-              int(np.clip(c[1] - u[1] * AXIS_LEN_PX, 0, fh - 1)))
-        p1 = (int(np.clip(c[0] + u[0] * AXIS_LEN_PX, 0, fw - 1)),
-              int(np.clip(c[1] + u[1] * AXIS_LEN_PX, 0, fh - 1)))
-        cv2.line(vis, p0, p1, col, 2, lineType=cv2.LINE_AA)
-        cv2.putText(vis, f"{lbl}{obj_id}", (p1[0] + 3, p1[1] + 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
-    return state
-
 # ---------------------------------------------------------------------------
 # Live camera frame provider
 # ---------------------------------------------------------------------------
@@ -575,7 +419,7 @@ class LiveFrameProvider:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run(args):
+def run(args) -> None:
     device = choose_device(args.device)
     print(f"Device: {device}")
 
@@ -621,7 +465,7 @@ def run(args):
     tmp = tempfile.mkdtemp(prefix="edgetam_live_")
     cv2.imwrite(os.path.join(tmp, "000000.jpg"), provider.get_raw(0))
     state = predictor.init_state(tmp, async_loading_frames=False)
-    import shutil; shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(tmp, ignore_errors=True)
 
     state["images"] = provider
     state["num_frames"] = 1_000_000
@@ -638,14 +482,11 @@ def run(args):
         h, w = TARGET_SIZE[1], TARGET_SIZE[0]
         writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (w, h))
 
-    # axis_states: dict[int, dict | None] = {}
     com_trails: dict[int, list[tuple[int, int]]] = {}  # obj_id -> list of (x, y) COM positions
     cube_states: dict[int, dict | None] = {}
     fps_t0 = time.perf_counter()
     fps_frames = 0
-    ac_device = device.split(":")[0]
-    ac_dtype = torch.bfloat16 if ac_device == "cuda" else torch.float16
-    ac_enabled = args.half and ac_device != "cpu"
+    ac_device, ac_dtype, ac_enabled = _autocast_config(device, args.half)
 
     print("Live tracking started. Press 'q' or ESC to stop.")
     try:
@@ -664,13 +505,6 @@ def run(args):
                     oid = ids[i]
                     binm = _mask_to_2d_bool(masks_np[i], fh, fw)
 
-                    # -- axes drawing (disabled) --
-                    # axis_states[oid] = draw_axes(
-                    #     vis, binm, oid, axis_states.get(oid),
-                    #     smooth_alpha=args.axis_smooth,
-                    # )
-
-                    # COM tracking
                     if np.any(binm):
                         ys, xs = np.where(binm)
                         cx, cy = int(xs.mean()), int(ys.mean())
@@ -720,7 +554,7 @@ def run(args):
         cv2.destroyAllWindows()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Real-time EdgeTAM tracking on Orbbec RGB stream.")
     parser.add_argument("--camera", type=int, default=0,
                         help="Camera index (default 0)")
