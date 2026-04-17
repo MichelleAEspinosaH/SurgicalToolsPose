@@ -8,7 +8,7 @@ points on the first frame, then streams live masks + oriented 3D cubes.
 Usage:
     .venv/bin/python live_track.py                        # camera 0, default settings
     .venv/bin/python live_track.py --camera 1             # different camera index
-    .venv/bin/python live_track.py --axis-smooth 0.9      # heavier axis smoothing
+    .venv/bin/python live_track.py --one-euro-beta 0.08   # stronger adaptive smoothing
     .venv/bin/python live_track.py --no-half              # disable half-precision
     .venv/bin/python live_track.py --output out.mp4       # save output video
 Keybindings:
@@ -462,6 +462,134 @@ def _icp(P, Q, prev_R=None, prev_t=None, max_iter=8, tol=1e-4):
     return r, t
 
 
+def _mesh_projection_iou(
+    mask_bool: np.ndarray,
+    verts: np.ndarray,
+    faces: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+) -> float:
+    """IoU between binary mask and mesh silhouette (filled projected faces)."""
+    fh, fw = mask_bool.shape[:2]
+    pred_mask = np.zeros((fh, fw), dtype=np.uint8)
+    proj_mesh, _ = cv2.projectPoints(verts.astype(np.float64), rvec, tvec, K, dist)
+    pts2d = proj_mesh.reshape(-1, 2)
+    for f in faces:
+        poly = np.round(pts2d[f]).astype(np.int32)
+        cv2.fillConvexPoly(pred_mask, poly, 255, lineType=cv2.LINE_AA)
+    pred_b = pred_mask > 0
+    sam_b = mask_bool
+    inter = float(np.logical_and(pred_b, sam_b).sum())
+    union = float(np.logical_or(pred_b, sam_b).sum())
+    return inter / union if union > 0.0 else 0.0
+
+
+def _reg_sign_from_state(state: dict) -> np.ndarray:
+    s = state.get("reg_sign")
+    if s is None:
+        return np.ones(3, dtype=np.float64)
+    return np.asarray(s, dtype=np.float64).reshape(3)
+
+
+# Number of uniform samples on each rectangle edge (total = 4 * PNP_PER_EDGE).
+# Dense PnP anchors pose better than 4 corners alone.
+PNP_PER_EDGE = 8
+ONE_EURO_MIN_CUTOFF = 1.2
+ONE_EURO_BETA = 0.02
+ONE_EURO_D_CUTOFF = 1.0
+
+
+def _sample_quad_perimeter(corners4: np.ndarray, n: int) -> np.ndarray:
+    """Uniform arc-length samples on a closed quadrilateral (first vertex not repeated).
+
+    corners4: (4, D) in cyclic order. Returns (n, D).
+    """
+    D = int(corners4.shape[1])
+    lens = np.linalg.norm(np.roll(corners4, -1, axis=0) - corners4, axis=1)
+    L = float(lens.sum())
+    out = np.zeros((n, D), dtype=np.float64)
+    if L < 1e-12:
+        return np.repeat(corners4[:1].astype(np.float64), n, axis=0)
+    cum = np.zeros(5, dtype=np.float64)
+    for i in range(4):
+        cum[i + 1] = cum[i] + lens[i]
+    for i in range(n):
+        t = ((i + 0.5) / n) * L
+        for k in range(4):
+            if cum[k + 1] >= t - 1e-15:
+                denom = lens[k] + 1e-12
+                u = (t - cum[k]) / denom
+                out[i] = corners4[k] * (1.0 - u) + corners4[(k + 1) % 4] * u
+                break
+    return out
+
+
+def _one_euro_alpha(cutoff: float, dt: float) -> float:
+    cutoff = max(float(cutoff), 1e-6)
+    dt = max(float(dt), 1e-6)
+    tau = 1.0 / (2.0 * np.pi * cutoff)
+    return 1.0 / (1.0 + tau / dt)
+
+
+class OneEuroScalar:
+    def __init__(self, min_cutoff: float, beta: float, d_cutoff: float):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev: float | None = None
+        self.dx_prev: float = 0.0
+        self.t_prev: float | None = None
+
+    def filter(self, x: float, t_s: float) -> float:
+        x = float(x)
+        t_s = float(t_s)
+        if self.x_prev is None or self.t_prev is None:
+            self.x_prev = x
+            self.t_prev = t_s
+            self.dx_prev = 0.0
+            return x
+        dt = max(t_s - self.t_prev, 1e-3)
+        dx = (x - self.x_prev) / dt
+        a_d = _one_euro_alpha(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = _one_euro_alpha(cutoff, dt)
+        x_hat = a * x + (1.0 - a) * self.x_prev
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = t_s
+        return x_hat
+
+
+def _apply_one_euro_pose_filter(
+    state: dict,
+    rv: np.ndarray,
+    tv: np.ndarray,
+    t_s: float,
+    min_cutoff: float,
+    beta: float,
+    d_cutoff: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    filters = state.get("one_euro_filters")
+    if filters is None or len(filters) != 6:
+        filters = [
+            OneEuroScalar(min_cutoff, beta, d_cutoff),
+            OneEuroScalar(min_cutoff, beta, d_cutoff),
+            OneEuroScalar(min_cutoff, beta, d_cutoff),
+            OneEuroScalar(min_cutoff, beta, d_cutoff),
+            OneEuroScalar(min_cutoff, beta, d_cutoff),
+            OneEuroScalar(min_cutoff, beta, d_cutoff),
+        ]
+        state["one_euro_filters"] = filters
+    vec = np.concatenate([rv.reshape(3), tv.reshape(3)]).astype(np.float64)
+    out = np.empty_like(vec)
+    for i in range(6):
+        out[i] = filters[i].filter(float(vec[i]), t_s)
+    return out[:3].reshape(3, 1), out[3:].reshape(3, 1)
+
+
 # ---------------------------------------------------------------------------
 # Mesh-based 6DoF pose estimator
 # ---------------------------------------------------------------------------
@@ -470,23 +598,28 @@ class MeshPoseEstimator:
     """
     6DoF pose estimator for an elongated surgical tool given its 3D mesh.
 
-    Model-space convention (matches draw_pose_axes.py):
-        X  (red)   — along tool primary axis (tip direction)
-        Y  (green) — secondary in-plane axis (width)
-        Z  (blue)  — tertiary out-of-plane axis (thickness)
+    Vertices live in a PCA-aligned frame (same order as columns of
+    ``mesh_vertices``):
+        axis 0  (red)   — primary / length
+        axis 1  (green) — secondary / width
+        axis 2  (blue)  — tertiary / thickness
 
-    PnP uses the four midplane silhouette corners, which span the full
-    length × width of the tool and lie in the Y=0 plane (coplanar → IPPE).
+    PnP matches the mask ``minAreaRect`` to the model midplane rectangle using
+    many uniformly sampled perimeter points (see ``PNP_PER_EDGE``), seeded by
+    IPPE on four corners then refined with ``SOLVEPNP_ITERATIVE``.
     """
 
     def __init__(self, mesh):
         verts = np.asarray(mesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
         cen = verts.mean(0)
         v = verts - cen
         cov = (v.T @ v) / len(v)
         eigvals, evecs = np.linalg.eigh(cov)
         order = np.argsort(eigvals)[::-1]   # longest axis first
         aligned = v @ evecs[:, order]
+        self.mesh_vertices = aligned.astype(np.float64)
+        self.mesh_faces = faces
 
         # Half-extents: 0=primary(length), 1=secondary(width), 2=tertiary(thickness)
         hP = (aligned[:, 0].max() - aligned[:, 0].min()) / 2
@@ -495,43 +628,48 @@ class MeshPoseEstimator:
         self.hP, self.hS, self.hT = hP, hS, hT
         self.extents = np.array([2 * hP, 2 * hS, 2 * hT])
 
-        # ── PnP model points ─────────────────────────────────────────────
-        # Four midplane silhouette corners in model XZ plane (Y=0):
-        #   X = secondary (width), Z = primary (along tool / length)
-        # Ordered clockwise from top-left when the tool points upward:
-        #   TL=(-hS, 0, hP)  TR=(hS, 0, hP)  BR=(hS, 0,-hP)  BL=(-hS, 0,-hP)
+        # ── PnP model points (same 3D basis as mesh_vertices) ────────────
+        # Midplane at thickness=0; corners span primary (±hP) × secondary (±hS).
         self.model_pts = np.array(
-            [[-hS, 0.0, hP], [hS, 0.0, hP], [hS, 0.0, -hP], [-hS, 0.0, -hP]],
+            [
+                [-hP, -hS, 0.0],
+                [hP, -hS, 0.0],
+                [hP, hS, 0.0],
+                [-hP, hS, 0.0],
+            ],
             dtype=np.float64,
         )
 
-        # ── Axis display points ───────────────────────────────────────────
-        # In model space: X=along tool(Z-dir), Y=width(X-dir), Z=out-of-plane(Y-dir)
-        ax = hP * 1.0                           # X axis: half tool length
-        ay = hS * 1.5                           # Y axis: 1.5× half-width
-        az = max(hT * 5.0, hP * 0.35)          # Z axis: boosted so it's visible
+        # ── Axis display points (origin + tips along mesh axes 0,1,2) ─────
+        ax = hP * 1.0
+        ay = hS * 1.5
+        az = max(hT * 5.0, hP * 0.35)
         self.axis_pts = np.array(
-            [[0.0, 0.0, 0.0],   # origin
-             [0.0, 0.0, ax],    # X tip (red)   = +Z model = along tool / tip
-             [ay,  0.0, 0.0],   # Y tip (green) = +X model = in-plane width
-             [0.0, az,  0.0]],  # Z tip (blue)  = +Y model = out-of-plane
+            [
+                [0.0, 0.0, 0.0],
+                [ax, 0.0, 0.0],
+                [0.0, ay, 0.0],
+                [0.0, 0.0, az],
+            ],
             dtype=np.float64,
         )
+        self._pnp_n = 4 * PNP_PER_EDGE
 
     # ------------------------------------------------------------------
-    def _pnp_best(
+    def _pnp_best_pts(
         self,
+        model_pts: np.ndarray,
         img_corners: np.ndarray,
         K: np.ndarray,
         dist: np.ndarray,
     ) -> tuple[np.ndarray | None, np.ndarray | None, float]:
         """
         Try all 4 cyclic shifts of model_pts → img_corners correspondences
-        with IPPE + ITERATIVE.  Return (rvec, tvec, reprojection_error).
+        with IPPE + ITERATIVE.  Return (rvec, tvec, mean reprojection error).
         """
         best_rv, best_tv, best_err = None, None, np.inf
         for shift in range(4):
-            pts = np.roll(self.model_pts, shift, axis=0)
+            pts = np.roll(model_pts, shift, axis=0)
             for flag in (cv2.SOLVEPNP_IPPE, cv2.SOLVEPNP_ITERATIVE):
                 ok, rv, tv = cv2.solvePnP(pts, img_corners, K, dist, flags=flag)
                 if not ok:
@@ -545,17 +683,84 @@ class MeshPoseEstimator:
         return best_rv, best_tv, best_err
 
     # ------------------------------------------------------------------
+    def _pnp_best_dense(
+        self,
+        model_corners4: np.ndarray,
+        img_corners4: np.ndarray,
+        K: np.ndarray,
+        dist: np.ndarray,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+        """
+        Many-point PnP on uniformly sampled mask/model rectangle perimeters.
+        Seeds each cyclic alignment with IPPE on 4 corners, then refines with
+        SOLVEPNP_ITERATIVE on all samples.
+        """
+        n = self._pnp_n
+        img_n = _sample_quad_perimeter(img_corners4.astype(np.float64), n)
+        model_n0 = _sample_quad_perimeter(model_corners4.astype(np.float64), n)
+        step = n // 4
+        best_rv, best_tv, best_err = None, None, np.inf
+        for shift in range(4):
+            mc4 = np.roll(model_corners4, shift, axis=0)
+            ok, rv0, tv0 = cv2.solvePnP(
+                mc4.astype(np.float64),
+                img_corners4.astype(np.float64),
+                K,
+                dist,
+                flags=cv2.SOLVEPNP_IPPE,
+            )
+            if not ok:
+                ok, rv0, tv0 = cv2.solvePnP(
+                    mc4.astype(np.float64),
+                    img_corners4.astype(np.float64),
+                    K,
+                    dist,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+            if not ok:
+                continue
+            model_n = np.roll(model_n0, shift * step, axis=0)
+            ok2, rv, tv = cv2.solvePnP(
+                model_n,
+                img_n,
+                K,
+                dist,
+                rv0,
+                tv0,
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if not ok2:
+                rv, tv = rv0, tv0
+            proj, _ = cv2.projectPoints(model_n, rv, tv, K, dist)
+            err = float(
+                np.mean(np.linalg.norm(proj.reshape(-1, 2) - img_n, axis=1))
+            )
+            if err < best_err:
+                best_err, best_rv, best_tv = err, rv, tv
+        if best_rv is None:
+            return self._pnp_best_pts(model_corners4, img_corners4, K, dist)
+        return best_rv, best_tv, best_err
+
+    # ------------------------------------------------------------------
     def estimate_pose(
         self,
         mask_bool: np.ndarray,
         K: np.ndarray,
         dist: np.ndarray,
         state: dict | None,
-        smooth_alpha: float = 0.8,
+        timestamp_s: float,
+        one_euro_min_cutoff: float = ONE_EURO_MIN_CUTOFF,
+        one_euro_beta: float = ONE_EURO_BETA,
+        one_euro_d_cutoff: float = ONE_EURO_D_CUTOFF,
     ) -> dict:
         """
         Estimate 6DoF pose from a binary mask.  Updates and returns the
-        per-object state dict (keys: 'rvec', 'tvec').
+        per-object state dict (keys: 'rvec', 'tvec', optional 'reg_sign').
+
+        PCA eigenvectors are sign-ambiguous; the first successful solve tests
+        all eight ``(±1,±1,±1)`` axis flips on model/mesh, picks the pose with
+        best mask–mesh projection IoU, then fixes ``reg_sign`` for later frames.
         """
         if state is None:
             state = {}
@@ -571,13 +776,52 @@ class MeshPoseEstimator:
         rect = cv2.minAreaRect(p32.reshape(-1, 1, 2))
         img_corners = _order_corners_clockwise(cv2.boxPoints(rect).astype(np.float64))
 
-        rv, tv, _ = self._pnp_best(img_corners, K, dist)
-        if rv is None:
-            return state
+        if "reg_sign" not in state:
+            best_key: tuple[float, float] = (-1.0, np.inf)  # (iou, repro_err) maximize iou then min err
+            best_rv, best_tv, best_s = None, None, None
+            for bits in range(8):
+                s = np.array(
+                    [
+                        -1.0 if (bits >> 0) & 1 else 1.0,
+                        -1.0 if (bits >> 1) & 1 else 1.0,
+                        -1.0 if (bits >> 2) & 1 else 1.0,
+                    ],
+                    dtype=np.float64,
+                )
+                model_s = self.model_pts * s
+                verts_s = self.mesh_vertices * s
+                rv, tv, err = self._pnp_best_dense(model_s, img_corners, K, dist)
+                if rv is None:
+                    continue
+                iou = _mesh_projection_iou(
+                    mask_bool, verts_s, self.mesh_faces, rv, tv, K, dist
+                )
+                key = (iou, err)
+                if key[0] > best_key[0] or (
+                    key[0] == best_key[0] and key[1] < best_key[1]
+                ):
+                    best_key = (key[0], key[1])
+                    best_rv, best_tv, best_s = rv, tv, s.copy()
+            if best_rv is None or best_s is None:
+                return state
+            state["reg_sign"] = best_s
+            rv, tv = best_rv, best_tv
+        else:
+            s = _reg_sign_from_state(state)
+            model_s = self.model_pts * s
+            rv, tv, _ = self._pnp_best_dense(model_s, img_corners, K, dist)
+            if rv is None:
+                return state
 
-        if "rvec" in state and smooth_alpha > 0.0:
-            rv = smooth_alpha * state["rvec"] + (1.0 - smooth_alpha) * rv
-            tv = smooth_alpha * state["tvec"] + (1.0 - smooth_alpha) * tv
+        rv, tv = _apply_one_euro_pose_filter(
+            state,
+            rv,
+            tv,
+            timestamp_s,
+            one_euro_min_cutoff,
+            one_euro_beta,
+            one_euro_d_cutoff,
+        )
         state["rvec"] = rv
         state["tvec"] = tv
         return state
@@ -620,7 +864,9 @@ def _draw_pose_axes(
     if rvec is None or tvec is None:
         return
 
-    proj, _ = cv2.projectPoints(axis_pts, rvec, tvec, K, dist)
+    s = _reg_sign_from_state(state)
+    axis_use = (axis_pts * s).astype(np.float64)
+    proj, _ = cv2.projectPoints(axis_use, rvec, tvec, K, dist)
     pts2d = proj.reshape(-1, 2)
 
     fh, fw = vis.shape[:2]
@@ -664,6 +910,77 @@ def _draw_pose_axes(
     cv2.rectangle(vis, (ox, oy - th - 4), (ox + tw + 2, oy + 2), (0, 0, 0), -1)
     cv2.putText(vis, label_r, (ox + 1, oy - th_t - 4), fnt, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(vis, label_t, (ox + 1, oy - 1), fnt, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def _draw_registration_debug(
+    canvas: np.ndarray,
+    mask_bool: np.ndarray,
+    state: dict,
+    est: MeshPoseEstimator,
+    K: np.ndarray,
+    dist: np.ndarray,
+    obj_id: int,
+) -> None:
+    """Visualize SAM mask vs projected GLB registration for one object.
+
+    Note: live pose is rigid (rotation + translation). No non-rigid stretch
+    is applied in this real-time path.
+    """
+    rvec = state.get("rvec")
+    tvec = state.get("tvec")
+    if rvec is None or tvec is None or not np.any(mask_bool):
+        return
+
+    fh, fw = canvas.shape[:2]
+    pred_mask = np.zeros((fh, fw), dtype=np.uint8)
+
+    # Project and draw full registered mesh faces as a wireframe/fill overlay.
+    s = _reg_sign_from_state(state)
+    verts = est.mesh_vertices * s
+    faces = est.mesh_faces
+    proj_mesh, _ = cv2.projectPoints(verts, rvec, tvec, K, dist)
+    pts2d = proj_mesh.reshape(-1, 2)
+    overlay = canvas.copy()
+    for f in faces:
+        poly = np.round(pts2d[f]).astype(np.int32)
+        cv2.fillConvexPoly(overlay, poly, (180, 130, 255), lineType=cv2.LINE_AA)  # light magenta fill
+        cv2.polylines(canvas, [poly], True, (255, 0, 255), 1, lineType=cv2.LINE_AA)  # magenta edges
+        cv2.fillConvexPoly(pred_mask, poly, 255, lineType=cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.22, canvas, 0.78, 0.0, dst=canvas)
+
+    # Draw SAM mask overlay in cyan.
+    sam_mask_u8 = (mask_bool.astype(np.uint8) * 255)
+    sam_color = np.zeros_like(canvas)
+    sam_color[:, :, 1] = sam_mask_u8
+    sam_color[:, :, 0] = sam_mask_u8
+    cv2.addWeighted(sam_color, 0.30, canvas, 1.0, 0.0, dst=canvas)
+
+    # 2D min-area rectangle around the full projected mesh (mesh footprint in image).
+    rect_mesh = cv2.minAreaRect(pts2d.astype(np.float32))
+    box_mesh = cv2.boxPoints(rect_mesh).astype(np.int32)
+    cv2.polylines(canvas, [box_mesh], True, (0, 255, 255), 2, lineType=cv2.LINE_AA)  # yellow = mesh 2D bbox
+
+    # Model midplane quad used by PnP (not the same as full mesh silhouette).
+    proj, _ = cv2.projectPoints(est.model_pts * s, rvec, tvec, K, dist)
+    poly = np.round(proj.reshape(-1, 2)).astype(np.int32)
+    if poly.shape[0] >= 3:
+        cv2.polylines(canvas, [poly], True, (255, 255, 255), 2, lineType=cv2.LINE_AA)  # white = PnP quad
+
+    # IoU between projected model polygon and SAM mask.
+    pred_b = pred_mask > 0
+    sam_b = mask_bool
+    inter = float(np.logical_and(pred_b, sam_b).sum())
+    union = float(np.logical_or(pred_b, sam_b).sum())
+    iou = inter / union if union > 0.0 else 0.0
+
+    ys, xs = np.where(mask_bool)
+    if len(xs) > 0:
+        tx, ty = int(xs.mean()), int(ys.mean())
+    else:
+        tx, ty = 12, 24
+    text = f"ID{obj_id} reg IoU={iou:.3f} (rigid)"
+    cv2.putText(canvas, text, (tx + 8, ty + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, text, (tx + 8, ty + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +1169,7 @@ def run(args) -> None:
         with torch.autocast(device_type=ac_device, dtype=ac_dtype, enabled=ac_enabled):
             for fi, obj_ids, masks in predictor.propagate_in_video(state):
                 frame = provider.get_raw(fi)
+                debug_canvas = frame.copy() if args.align_debug_out else None
                 if hasattr(obj_ids, "tolist"):
                     ids = [int(x) for x in obj_ids.tolist()]
                 else:
@@ -875,20 +1193,29 @@ def run(args) -> None:
                         if est is not None:
                             # Full 6DoF pose estimation + XYZ axis overlay
                             pose_states[oid] = est.estimate_pose(
-                                binm, K_cam, dist_cam,
+                                binm,
+                                K_cam,
+                                dist_cam,
                                 pose_states.get(oid),
-                                smooth_alpha=args.axis_smooth,
+                                timestamp_s=time.perf_counter(),
+                                one_euro_min_cutoff=args.one_euro_min_cutoff,
+                                one_euro_beta=args.one_euro_beta,
+                                one_euro_d_cutoff=args.one_euro_d_cutoff,
                             )
                             _draw_pose_axes(
                                 vis, pose_states[oid], K_cam, dist_cam,
                                 est.axis_pts, oid,
                             )
+                            if debug_canvas is not None:
+                                _draw_registration_debug(
+                                    debug_canvas, binm, pose_states[oid], est, K_cam, dist_cam, oid
+                                )
                         else:
                             # Fallback disabled: do not draw per-object bounding-box cubes.
                             # cube_states[oid] = _draw_3d_cube_from_mask(
                             #     vis, binm, oid, cube_states.get(oid),
                             #     mesh_dims=None,
-                            #     smooth_alpha=args.axis_smooth,
+                            #     smooth_alpha=0.8,
                             # )
                             pass
 
@@ -910,6 +1237,8 @@ def run(args) -> None:
                 cv2.imshow("EdgeTAM Live", vis)
                 if writer is not None:
                     writer.write(vis)
+                if debug_canvas is not None:
+                    cv2.imwrite(args.align_debug_out, debug_canvas)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -939,13 +1268,22 @@ def main() -> None:
                         choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--alpha", type=float, default=0.45,
                         help="Mask overlay alpha")
-    parser.add_argument("--axis-smooth", type=float, default=0.8, metavar="ALPHA",
-                        help="EMA smoothing for axes (0=none, 0.99=heavy, default 0.8)")
+    parser.add_argument("--one-euro-min-cutoff", type=float, default=ONE_EURO_MIN_CUTOFF,
+                        help="One Euro filter min cutoff (Hz-ish); higher = less smoothing")
+    parser.add_argument("--one-euro-beta", type=float, default=ONE_EURO_BETA,
+                        help="One Euro speed coefficient; higher = more responsive motion")
+    parser.add_argument("--one-euro-d-cutoff", type=float, default=ONE_EURO_D_CUTOFF,
+                        help="One Euro derivative cutoff (Hz-ish)")
     parser.add_argument("--half", action="store_true", default=True,
                         help="Use half-precision autocast (default: on)")
     parser.add_argument("--no-half", dest="half", action="store_false")
     parser.add_argument("--output", default="",
                         help="Optional path to save output video (e.g. out.mp4)")
+    parser.add_argument(
+        "--align-debug-out",
+        default="",
+        help="Optional path to save registration-debug image (SAM mask vs projected GLB) each frame.",
+    )
     # --sam3d / --fal-key removed (fal-ai integration commented out)
     args = parser.parse_args()
     run(args)
