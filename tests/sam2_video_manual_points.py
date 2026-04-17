@@ -493,7 +493,7 @@ def _render_frame(
     writer,
     seed_points: list | None = None,
     smooth_alpha: float = 0.0,
-) -> None:
+) -> tuple[np.ndarray, dict[int, np.ndarray]]:
     if hasattr(obj_ids, "tolist"):
         obj_ids_list = [int(x) for x in obj_ids.tolist()]
     else:
@@ -502,9 +502,11 @@ def _render_frame(
     vis = overlay_masks_with_ids(frame, obj_ids_list, masks, alpha=args.alpha)
     fh, fw = frame.shape[:2]
     masks_np = masks.detach().cpu().numpy()
+    binary_masks: dict[int, np.ndarray] = {}
     for i in range(min(len(obj_ids_list), masks_np.shape[0])):
         oid = obj_ids_list[i]
         binm = _mask_to_2d_bool(masks_np[i], fh, fw)
+        binary_masks[oid] = binm
         axis_states[oid] = draw_object_axes_icp(vis, binm, oid, axis_states.get(oid), smooth_alpha=smooth_alpha)
 
     if seed_points and frame_idx == 0:
@@ -524,6 +526,7 @@ def _render_frame(
     cv2.imshow("SAM2", vis)
     if writer is not None:
         writer.write(vis)
+    return vis, binary_masks
 
 
 def _make_writer(args, fps: float = 30.0):
@@ -589,6 +592,8 @@ def run_video(args, predictor, device: str) -> None:
     cur_idx = -1
     axis_states: dict[int, dict | None] = {}
     frame = None
+    last_vis: np.ndarray | None = None
+    last_binary_masks: dict[int, np.ndarray] = {}
 
     ac_device = device.split(":")[0]
     ac_dtype = torch.bfloat16 if ac_device == "cuda" else torch.float16
@@ -607,8 +612,17 @@ def run_video(args, predictor, device: str) -> None:
                 break
             display_frame = preprocess_frame(frame)
 
-            _render_frame(frame_idx, obj_ids, masks, display_frame, axis_states, args, writer,
-                          seed_points=points, smooth_alpha=args.axis_smooth)
+            last_vis, last_binary_masks = _render_frame(
+                frame_idx,
+                obj_ids,
+                masks,
+                display_frame,
+                axis_states,
+                args,
+                writer,
+                seed_points=points,
+                smooth_alpha=args.axis_smooth,
+            )
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -617,6 +631,14 @@ def run_video(args, predictor, device: str) -> None:
     cap.release()
     if writer is not None:
         writer.release()
+    if args.segmented_out and last_vis is not None:
+        cv2.imwrite(args.segmented_out, last_vis)
+        print(f"Saved segmented image: {args.segmented_out}")
+    if args.mask_out and last_binary_masks:
+        obj_id = min(last_binary_masks)
+        mask_img = (last_binary_masks[obj_id].astype(np.uint8) * 255)
+        cv2.imwrite(args.mask_out, mask_img)
+        print(f"Saved binary mask for ID{obj_id}: {args.mask_out}")
     if temp_frames_dir and os.path.exists(temp_frames_dir):
         shutil.rmtree(temp_frames_dir, ignore_errors=True)
     cv2.destroyAllWindows()
@@ -736,6 +758,16 @@ def main():
     )
     parser.add_argument("--alpha", type=float, default=0.45, help="Mask overlay alpha")
     parser.add_argument("--output", default="", help="Optional output video path")
+    parser.add_argument(
+        "--segmented-out",
+        default="",
+        help="Optional path to save the last rendered segmented frame (e.g. segmented_scissors.png).",
+    )
+    parser.add_argument(
+        "--mask-out",
+        default="",
+        help="Optional path to save a binary mask image for the first selected object.",
+    )
     parser.add_argument(
         "--frame-step",
         type=int,
