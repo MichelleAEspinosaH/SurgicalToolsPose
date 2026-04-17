@@ -3,12 +3,12 @@
 Real-time surgical tool tracking with EdgeTAM.
 
 Opens the Orbbec RGB camera (or any camera index), lets you click seed
-points on the first frame, then streams live masks + oriented 3D cubes.
+points on the first frame, then streams live masks + mesh-based 6DoF overlays.
 
 Usage:
     .venv/bin/python live_track.py                        # camera 0, default settings
     .venv/bin/python live_track.py --camera 1             # different camera index
-    .venv/bin/python live_track.py --one-euro-beta 0.08   # stronger adaptive smoothing
+    .venv/bin/python live_track.py --kalman-process-var 2e-4   # smoother pose tracks
     .venv/bin/python live_track.py --no-half              # disable half-precision
     .venv/bin/python live_track.py --output out.mp4       # save output video
 Keybindings:
@@ -17,6 +17,7 @@ Keybindings:
 """
 
 import argparse
+import csv
 import os
 import re
 import shutil
@@ -25,7 +26,6 @@ import sys
 import tempfile
 import threading
 import time
-# import urllib.request  # (used by SAM3D / fal-ai worker — commented out)
 from pathlib import Path
 
 import cv2
@@ -33,18 +33,9 @@ import numpy as np
 import torch
 
 try:
-    from scipy.spatial import cKDTree
-except Exception:
-    cKDTree = None
-try:
     import trimesh  # type: ignore
 except Exception:
     trimesh = None
-
-# try:
-#     import fal_client  # type: ignore  # pip install fal-client
-# except ImportError:
-#     fal_client = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -54,7 +45,6 @@ TARGET_SIZE = (640, 360)
 EDGETAM_REPO = Path(__file__).parent / "EdgeTAM"
 CHECKPOINT = EDGETAM_REPO / "checkpoints" / "edgetam.pt"
 MODEL_CFG = "configs/edgetam.yaml"
-# SAM3D_ENDPOINT = "fal-ai/sam-3/3d-objects"  # (fal-ai — commented out)
 
 _IMG_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 _IMG_STD  = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
@@ -221,30 +211,6 @@ def overlay_masks(frame, obj_ids, masks, alpha=0.45):
     return vis.astype(np.uint8)
 
 
-def _load_tool_mesh_dims() -> dict[int, np.ndarray]:
-    """Load per-object mesh extents (x, y, z) for object IDs 1..3."""
-    dims: dict[int, np.ndarray] = {}
-    if trimesh is None:
-        return dims
-
-    base = Path(__file__).parent
-    for obj_id in (1, 2, 3):
-        stem = f"object_{obj_id - 1}"
-        candidates = [base / f"{stem}.ply", base / f"{stem}.glb"]
-        for p in candidates:
-            if not p.exists():
-                continue
-            try:
-                mesh = trimesh.load(str(p), force="mesh")
-                ext = np.asarray(getattr(mesh, "extents", None), dtype=np.float64)
-                if ext.shape == (3,) and np.all(ext > 0):
-                    dims[obj_id] = ext
-                    break
-            except Exception:
-                continue
-    return dims
-
-
 def _order_corners_clockwise(corners: np.ndarray) -> np.ndarray:
     center = corners.mean(axis=0)
     ang = np.arctan2(corners[:, 1] - center[1], corners[:, 0] - center[0])
@@ -252,16 +218,6 @@ def _order_corners_clockwise(corners: np.ndarray) -> np.ndarray:
     # Rotate order so first corner is top-most, then left-most.
     idx0 = int(np.argmin(ordered[:, 1] * 10000.0 + ordered[:, 0]))
     return np.roll(ordered, -idx0, axis=0)
-
-
-def _camera_matrix_for_frame(width: int, height: int) -> np.ndarray:
-    # Fallback intrinsics used only by the cube overlay path (no cap available).
-    # Assumes 65° horizontal FOV — covers most webcams and phone cameras.
-    f = width / (2.0 * np.tan(np.radians(65.0) / 2.0))
-    return np.array(
-        [[f, 0.0, width / 2.0], [0.0, f, height / 2.0], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
 
 
 def _estimate_intrinsics_from_cap(
@@ -291,176 +247,6 @@ def _estimate_intrinsics_from_cap(
         [[f, 0.0, target_w / 2.0], [0.0, f, target_h / 2.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
-
-
-def _draw_cube_from_faces(vis: np.ndarray, front_i: np.ndarray, back_i: np.ndarray, obj_id: int) -> None:
-    col = point_color(obj_id)
-    col_back = (max(0, col[0] - 80), max(0, col[1] - 80), max(0, col[2] - 80))
-    cv2.polylines(vis, [back_i], True, col_back, 2, cv2.LINE_AA)
-    cv2.polylines(vis, [front_i], True, col, 2, cv2.LINE_AA)
-    for i in range(4):
-        cv2.line(vis, tuple(front_i[i]), tuple(back_i[i]), col, 2, cv2.LINE_AA)
-    cv2.putText(
-        vis,
-        f"CUBE{obj_id}",
-        tuple(front_i[0] + np.array([4, -4], dtype=np.int32)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        col,
-        2,
-        lineType=cv2.LINE_AA,
-    )
-
-
-def _draw_3d_cube_from_mask(
-    vis: np.ndarray,
-    mask_bool: np.ndarray,
-    obj_id: int,
-    state: dict | None,
-    mesh_dims: np.ndarray | None = None,
-    smooth_alpha: float = 0.8,
-) -> dict | None:
-    if not np.any(mask_bool):
-        return state
-
-    if state is None:
-        state = {}
-
-    clean = cv2.erode(mask_bool.astype(np.uint8) * 255, np.ones((3, 3), np.uint8)) > 0
-    ys, xs = np.where(clean)
-    if len(xs) < 20:
-        return state
-
-    p32 = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
-    rect = cv2.minAreaRect(p32.reshape(-1, 1, 2))
-    img_corners = _order_corners_clockwise(cv2.boxPoints(rect).astype(np.float64))
-
-    if mesh_dims is not None and mesh_dims.shape == (3,):
-        sx, sy, sz = [float(v) for v in mesh_dims]
-    else:
-        rw, rh = rect[1]
-        sx, sy, sz = max(1.0, float(rw)), max(1.0, float(rh)), 0.35 * max(1.0, min(float(rw), float(rh)))
-
-    hw, hh, hd = 0.5 * sx, 0.5 * sy, 0.5 * sz
-    obj_front = np.array(
-        [[-hw, -hh, hd], [hw, -hh, hd], [hw, hh, hd], [-hw, hh, hd]],
-        dtype=np.float64,
-    )
-    obj_corners = np.array(
-        [
-            [-hw, -hh, hd], [hw, -hh, hd], [hw, hh, hd], [-hw, hh, hd],
-            [-hw, -hh, -hd], [hw, -hh, -hd], [hw, hh, -hd], [-hw, hh, -hd],
-        ],
-        dtype=np.float64,
-    )
-
-    fh, fw = vis.shape[:2]
-    K = _camera_matrix_for_frame(fw, fh)
-    dist = np.zeros((4, 1), dtype=np.float64)
-    ok, rvec, tvec = cv2.solvePnP(obj_front, img_corners, K, dist, flags=cv2.SOLVEPNP_IPPE)
-    if not ok:
-        ok, rvec, tvec = cv2.solvePnP(obj_front, img_corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
-    if not ok:
-        # Robust fallback: still draw a visible pseudo-3D cube from the 2D min-area box.
-        front = img_corners
-        rw, rh = rect[1]
-        depth = max(8.0, 0.35 * min(float(rw), float(rh)))
-        shift2d = np.array([-depth, -depth], dtype=np.float64)
-        back = front + shift2d[None, :]
-        front_i = np.round(front).astype(np.int32)
-        back_i = np.round(back).astype(np.int32)
-        _draw_cube_from_faces(vis, front_i, back_i, obj_id)
-        return state
-
-    if "rvec" in state and "tvec" in state and smooth_alpha > 0.0:
-        rvec = smooth_alpha * state["rvec"] + (1.0 - smooth_alpha) * rvec
-        tvec = smooth_alpha * state["tvec"] + (1.0 - smooth_alpha) * tvec
-    state["rvec"] = rvec
-    state["tvec"] = tvec
-
-    proj, _ = cv2.projectPoints(obj_corners, rvec, tvec, K, dist)
-    proj = proj.reshape(-1, 2)
-    front_i = np.round(proj[:4]).astype(np.int32)
-    back_i = np.round(proj[4:]).astype(np.int32)
-    _draw_cube_from_faces(vis, front_i, back_i, obj_id)
-    return state
-
-# ---------------------------------------------------------------------------
-# ICP pose axes
-# ---------------------------------------------------------------------------
-
-def _resample_contour(mask_bool, num_pts):
-    m = mask_bool.astype(np.uint8) * 255
-    cnts, _ = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-    if not cnts:
-        return None
-    pts_all, w_all = [], []
-    for c in cnts:
-        if len(c) < 5:
-            continue
-        p = c.reshape(-1, 2).astype(np.float64)
-        prev, nxt = np.roll(p, 1, 0), np.roll(p, -1, 0)
-        v1, v2 = p - prev, nxt - p
-        n1 = np.linalg.norm(v1, axis=1) + 1e-9
-        n2 = np.linalg.norm(v2, axis=1) + 1e-9
-        curv = np.arccos(np.clip(np.sum(v1 * v2, axis=1) / (n1 * n2), -1, 1))
-        pts_all.append(p)
-        w_all.append(1.0 + 3.0 * curv / np.pi)
-    if not pts_all:
-        return None
-    pts = np.vstack(pts_all)
-    w = np.concatenate(w_all)
-    if len(pts) <= num_pts:
-        return pts
-    prob = w / (w.sum() + 1e-12)
-    return pts[np.random.default_rng(0).choice(len(pts), num_pts, replace=False, p=prob)]
-
-
-def _pca_axes(mask_bool):
-    ys, xs = np.where(mask_bool)
-    if len(xs) < 12:
-        return None
-    p = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
-    c = p.mean(0)
-    cov = ((p - c).T @ (p - c)) / max(len(p), 1)
-    w, v = np.linalg.eigh(cov)
-    order = np.argsort(w)
-    return c, v[:, order[-1]] / (np.linalg.norm(v[:, order[-1]]) + 1e-12), \
-              v[:, order[0]]  / (np.linalg.norm(v[:, order[0]])  + 1e-12)
-
-
-def _kabsch(P, Q):
-    mu_p, mu_q = P.mean(0), Q.mean(0)
-    h = (P - mu_p).T @ (Q - mu_q)
-    u, _, vt = np.linalg.svd(h)
-    if np.linalg.det(u @ vt) < 0:
-        vt = vt.copy(); vt[1] *= -1
-    r = u @ vt
-    return r.astype(np.float64), (mu_q - mu_p @ r.T).astype(np.float64)
-
-
-def _icp(P, Q, prev_R=None, prev_t=None, max_iter=8, tol=1e-4):
-    if P.shape[0] < 3 or Q.shape[0] < 3:
-        return np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64)
-    r = prev_R.copy() if prev_R is not None else np.eye(2, dtype=np.float64)
-    t = prev_t.copy() if prev_t is not None else Q.mean(0) - (P @ r.T).mean(0)
-    tree = cKDTree(Q) if cKDTree is not None else None
-    prev_err = np.inf
-    for _ in range(max_iter):
-        p_t = P @ r.T + t
-        if tree is not None:
-            dist, idx = tree.query(p_t)
-            err = float(np.mean(dist * dist))
-        else:
-            d2 = np.sum((p_t[:, None] - Q[None]) ** 2, axis=2)
-            idx, err = np.argmin(d2, axis=1), float(np.mean(np.min(d2, axis=1)))
-        ri, ti = _kabsch(p_t, Q[idx])
-        r, t = ri @ r, t @ ri.T + ti
-        if prev_err < np.inf and abs(prev_err - err) < tol:
-            break
-        prev_err = err
-    return r, t
-
 
 def _mesh_projection_iou(
     mask_bool: np.ndarray,
@@ -496,9 +282,11 @@ def _reg_sign_from_state(state: dict) -> np.ndarray:
 # Number of uniform samples on each rectangle edge (total = 4 * PNP_PER_EDGE).
 # Dense PnP anchors pose better than 4 corners alone.
 PNP_PER_EDGE = 8
-ONE_EURO_MIN_CUTOFF = 1.2
-ONE_EURO_BETA = 0.02
-ONE_EURO_D_CUTOFF = 1.0
+KALMAN_PROCESS_VAR = 2e-4
+KALMAN_MEAS_VAR = 4e-3
+PNP_ROT_SMOOTH_W = 0.03
+PNP_TRANS_SMOOTH_W = 8.0
+PNP_SHIFT_PENALTY = 0.75
 
 
 def _sample_quad_perimeter(corners4: np.ndarray, n: int) -> np.ndarray:
@@ -526,67 +314,87 @@ def _sample_quad_perimeter(corners4: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
-def _one_euro_alpha(cutoff: float, dt: float) -> float:
-    cutoff = max(float(cutoff), 1e-6)
-    dt = max(float(dt), 1e-6)
-    tau = 1.0 / (2.0 * np.pi * cutoff)
-    return 1.0 / (1.0 + tau / dt)
+def _sample_mask_contour(mask_u8: np.ndarray, n: int) -> np.ndarray | None:
+    """Uniformly sample n points along the largest contour of a binary mask."""
+    cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return None
+    cnt = max(cnts, key=cv2.contourArea)
+    if cnt is None or len(cnt) < 4:
+        return None
+    poly = cnt.reshape(-1, 2).astype(np.float64)
+    d = np.linalg.norm(np.roll(poly, -1, axis=0) - poly, axis=1)
+    L = float(d.sum())
+    if L < 1e-9:
+        return None
+    out = np.zeros((n, 2), dtype=np.float64)
+    cum = np.zeros(len(poly) + 1, dtype=np.float64)
+    for i in range(len(poly)):
+        cum[i + 1] = cum[i] + d[i]
+    for i in range(n):
+        t = ((i + 0.5) / n) * L
+        k = int(np.searchsorted(cum, t, side="right") - 1)
+        k = int(np.clip(k, 0, len(poly) - 1))
+        seg = d[k] + 1e-12
+        u = (t - cum[k]) / seg
+        out[i] = poly[k] * (1.0 - u) + poly[(k + 1) % len(poly)] * u
+    return out
 
 
-class OneEuroScalar:
-    def __init__(self, min_cutoff: float, beta: float, d_cutoff: float):
-        self.min_cutoff = float(min_cutoff)
-        self.beta = float(beta)
-        self.d_cutoff = float(d_cutoff)
-        self.x_prev: float | None = None
-        self.dx_prev: float = 0.0
-        self.t_prev: float | None = None
-
-    def filter(self, x: float, t_s: float) -> float:
-        x = float(x)
-        t_s = float(t_s)
-        if self.x_prev is None or self.t_prev is None:
-            self.x_prev = x
-            self.t_prev = t_s
-            self.dx_prev = 0.0
-            return x
-        dt = max(t_s - self.t_prev, 1e-3)
-        dx = (x - self.x_prev) / dt
-        a_d = _one_euro_alpha(self.d_cutoff, dt)
-        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
-        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
-        a = _one_euro_alpha(cutoff, dt)
-        x_hat = a * x + (1.0 - a) * self.x_prev
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        self.t_prev = t_s
-        return x_hat
+def _rotation_delta_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
+    """Geodesic angular difference between two Rodrigues rotations."""
+    Ra, _ = cv2.Rodrigues(rvec_a.astype(np.float64))
+    Rb, _ = cv2.Rodrigues(rvec_b.astype(np.float64))
+    R = Ra @ Rb.T
+    tr = float(np.trace(R))
+    c = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(c)))
 
 
-def _apply_one_euro_pose_filter(
+class KalmanScalar:
+    def __init__(self, process_var: float, meas_var: float):
+        self.q = max(float(process_var), 1e-12)
+        self.r = max(float(meas_var), 1e-12)
+        self.x: float | None = None
+        self.p: float = 1.0
+
+    def filter(self, z: float) -> float:
+        z = float(z)
+        if self.x is None:
+            self.x = z
+            self.p = 1.0
+            return z
+        # Predict: x_k|k-1 = x_k-1, P_k|k-1 = P_k-1 + Q
+        self.p += self.q
+        # Update with measurement z_k
+        k = self.p / (self.p + self.r)
+        self.x = self.x + k * (z - self.x)
+        self.p = (1.0 - k) * self.p
+        return self.x
+
+
+def _apply_kalman_pose_filter(
     state: dict,
     rv: np.ndarray,
     tv: np.ndarray,
-    t_s: float,
-    min_cutoff: float,
-    beta: float,
-    d_cutoff: float,
+    process_var: float,
+    meas_var: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    filters = state.get("one_euro_filters")
+    filters = state.get("kalman_filters")
     if filters is None or len(filters) != 6:
         filters = [
-            OneEuroScalar(min_cutoff, beta, d_cutoff),
-            OneEuroScalar(min_cutoff, beta, d_cutoff),
-            OneEuroScalar(min_cutoff, beta, d_cutoff),
-            OneEuroScalar(min_cutoff, beta, d_cutoff),
-            OneEuroScalar(min_cutoff, beta, d_cutoff),
-            OneEuroScalar(min_cutoff, beta, d_cutoff),
+            KalmanScalar(process_var, meas_var),
+            KalmanScalar(process_var, meas_var),
+            KalmanScalar(process_var, meas_var),
+            KalmanScalar(process_var, meas_var),
+            KalmanScalar(process_var, meas_var),
+            KalmanScalar(process_var, meas_var),
         ]
-        state["one_euro_filters"] = filters
+        state["kalman_filters"] = filters
     vec = np.concatenate([rv.reshape(3), tv.reshape(3)]).astype(np.float64)
     out = np.empty_like(vec)
     for i in range(6):
-        out[i] = filters[i].filter(float(vec[i]), t_s)
+        out[i] = filters[i].filter(float(vec[i]))
     return out[:3].reshape(3, 1), out[3:].reshape(3, 1)
 
 
@@ -689,58 +497,67 @@ class MeshPoseEstimator:
         img_corners4: np.ndarray,
         K: np.ndarray,
         dist: np.ndarray,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+        prev_rvec: np.ndarray | None = None,
+        prev_tvec: np.ndarray | None = None,
+        prev_shift: int | None = None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, float, int | None]:
         """
         Many-point PnP on uniformly sampled mask/model rectangle perimeters.
-        Seeds each cyclic alignment with IPPE on 4 corners, then refines with
-        SOLVEPNP_ITERATIVE on all samples.
+        Solves directly on all sampled correspondences (32 by default).
         """
         n = self._pnp_n
         img_n = _sample_quad_perimeter(img_corners4.astype(np.float64), n)
         model_n0 = _sample_quad_perimeter(model_corners4.astype(np.float64), n)
         step = n // 4
-        best_rv, best_tv, best_err = None, None, np.inf
+        best_rv, best_tv, best_err, best_shift = None, None, np.inf, None
+        best_score = np.inf
         for shift in range(4):
-            mc4 = np.roll(model_corners4, shift, axis=0)
-            ok, rv0, tv0 = cv2.solvePnP(
-                mc4.astype(np.float64),
-                img_corners4.astype(np.float64),
-                K,
-                dist,
-                flags=cv2.SOLVEPNP_IPPE,
-            )
-            if not ok:
-                ok, rv0, tv0 = cv2.solvePnP(
-                    mc4.astype(np.float64),
-                    img_corners4.astype(np.float64),
-                    K,
-                    dist,
-                    flags=cv2.SOLVEPNP_ITERATIVE,
-                )
-            if not ok:
-                continue
             model_n = np.roll(model_n0, shift * step, axis=0)
-            ok2, rv, tv = cv2.solvePnP(
+            ok, rv, tv = cv2.solvePnP(
                 model_n,
                 img_n,
                 K,
                 dist,
-                rv0,
-                tv0,
-                useExtrinsicGuess=True,
                 flags=cv2.SOLVEPNP_ITERATIVE,
             )
-            if not ok2:
-                rv, tv = rv0, tv0
+            if not ok:
+                ok_epnp, rv_epnp, tv_epnp = cv2.solvePnP(
+                    model_n,
+                    img_n,
+                    K,
+                    dist,
+                    flags=cv2.SOLVEPNP_EPNP,
+                )
+                if not ok_epnp:
+                    continue
+                ok_refine, rv, tv = cv2.solvePnP(
+                    model_n,
+                    img_n,
+                    K,
+                    dist,
+                    rv_epnp,
+                    tv_epnp,
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if not ok_refine:
+                    rv, tv = rv_epnp, tv_epnp
             proj, _ = cv2.projectPoints(model_n, rv, tv, K, dist)
             err = float(
                 np.mean(np.linalg.norm(proj.reshape(-1, 2) - img_n, axis=1))
             )
-            if err < best_err:
-                best_err, best_rv, best_tv = err, rv, tv
-        if best_rv is None:
-            return self._pnp_best_pts(model_corners4, img_corners4, K, dist)
-        return best_rv, best_tv, best_err
+            score = err
+            if prev_rvec is not None and prev_tvec is not None:
+                d_rot = _rotation_delta_deg(rv, prev_rvec)
+                z_ref = max(abs(float(prev_tvec[2, 0])), 1e-6)
+                d_t = float(np.linalg.norm(tv.reshape(3) - prev_tvec.reshape(3)) / z_ref)
+                score += PNP_ROT_SMOOTH_W * d_rot + PNP_TRANS_SMOOTH_W * d_t
+            if prev_shift is not None and shift != int(prev_shift):
+                score += PNP_SHIFT_PENALTY
+            if score < best_score:
+                best_score = score
+                best_err, best_rv, best_tv, best_shift = err, rv, tv, shift
+        return best_rv, best_tv, best_err, best_shift
 
     # ------------------------------------------------------------------
     def estimate_pose(
@@ -749,10 +566,8 @@ class MeshPoseEstimator:
         K: np.ndarray,
         dist: np.ndarray,
         state: dict | None,
-        timestamp_s: float,
-        one_euro_min_cutoff: float = ONE_EURO_MIN_CUTOFF,
-        one_euro_beta: float = ONE_EURO_BETA,
-        one_euro_d_cutoff: float = ONE_EURO_D_CUTOFF,
+        kalman_process_var: float = KALMAN_PROCESS_VAR,
+        kalman_meas_var: float = KALMAN_MEAS_VAR,
     ) -> dict:
         """
         Estimate 6DoF pose from a binary mask.  Updates and returns the
@@ -778,7 +593,7 @@ class MeshPoseEstimator:
 
         if "reg_sign" not in state:
             best_key: tuple[float, float] = (-1.0, np.inf)  # (iou, repro_err) maximize iou then min err
-            best_rv, best_tv, best_s = None, None, None
+            best_rv, best_tv, best_s, best_shift = None, None, None, None
             for bits in range(8):
                 s = np.array(
                     [
@@ -790,7 +605,7 @@ class MeshPoseEstimator:
                 )
                 model_s = self.model_pts * s
                 verts_s = self.mesh_vertices * s
-                rv, tv, err = self._pnp_best_dense(model_s, img_corners, K, dist)
+                rv, tv, err, shift = self._pnp_best_dense(model_s, img_corners, K, dist)
                 if rv is None:
                     continue
                 iou = _mesh_projection_iou(
@@ -802,25 +617,44 @@ class MeshPoseEstimator:
                 ):
                     best_key = (key[0], key[1])
                     best_rv, best_tv, best_s = rv, tv, s.copy()
+                    best_shift = shift
             if best_rv is None or best_s is None:
                 return state
             state["reg_sign"] = best_s
             rv, tv = best_rv, best_tv
+            state["pnp_shift"] = 0 if best_shift is None else int(best_shift)
         else:
             s = _reg_sign_from_state(state)
             model_s = self.model_pts * s
-            rv, tv, _ = self._pnp_best_dense(model_s, img_corners, K, dist)
+            prev_rv = state.get("rvec_raw")
+            prev_tv = state.get("tvec_raw")
+            if prev_rv is None:
+                prev_rv = state.get("rvec")
+            if prev_tv is None:
+                prev_tv = state.get("tvec")
+            rv, tv, _, shift = self._pnp_best_dense(
+                model_s,
+                img_corners,
+                K,
+                dist,
+                prev_rvec=prev_rv,
+                prev_tvec=prev_tv,
+                prev_shift=state.get("pnp_shift"),
+            )
             if rv is None:
                 return state
+            if shift is not None:
+                state["pnp_shift"] = int(shift)
 
-        rv, tv = _apply_one_euro_pose_filter(
+        state["rvec_raw"] = rv.copy()
+        state["tvec_raw"] = tv.copy()
+
+        rv, tv = _apply_kalman_pose_filter(
             state,
             rv,
             tv,
-            timestamp_s,
-            one_euro_min_cutoff,
-            one_euro_beta,
-            one_euro_d_cutoff,
+            kalman_process_var,
+            kalman_meas_var,
         )
         state["rvec"] = rv
         state["tvec"] = tv
@@ -858,7 +692,7 @@ def _draw_pose_axes(
     axis_pts: np.ndarray,
     obj_id: int,
 ) -> None:
-    """Project and draw X(red)/Y(green)/Z(blue) pose axes + euler-angle readout."""
+    """Project and draw X(red)/Y(green)/Z(blue) pose axes."""
     rvec = state.get("rvec")
     tvec = state.get("tvec")
     if rvec is None or tvec is None:
@@ -888,28 +722,60 @@ def _draw_pose_axes(
     cv2.putText(vis, "Y", (y_tip[0] + 4, y_tip[1] + 4), fnt, 0.50, (0, 200, 0),  1, cv2.LINE_AA)
     cv2.putText(vis, "Z", (z_tip[0] + 4, z_tip[1] + 4), fnt, 0.50, (220, 80, 0), 1, cv2.LINE_AA)
 
-    # Euler angles (ZYX) for readout
+
+def _draw_pose_hud(vis: np.ndarray, pose_states: dict[int, dict]) -> None:
+    """Draw fixed-corner R/T readouts for all objects."""
+    if not pose_states:
+        return
+    x0, y0 = 12, 18
+    line_h = 18
+    fnt = cv2.FONT_HERSHEY_SIMPLEX
+    for row, oid in enumerate(sorted(pose_states)):
+        st = pose_states.get(oid, {})
+        rvec = st.get("rvec")
+        tvec = st.get("tvec")
+        if rvec is None or tvec is None:
+            continue
+        # Euler angles (ZYX) for readout
+        R, _ = cv2.Rodrigues(rvec)
+        sy = float(np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2))
+        if sy > 1e-6:
+            rx = np.degrees(np.arctan2(float(R[2, 1]), float(R[2, 2])))
+            ry = np.degrees(np.arctan2(-float(R[2, 0]), sy))
+            rz = np.degrees(np.arctan2(float(R[1, 0]), float(R[0, 0])))
+        else:
+            rx = np.degrees(np.arctan2(-float(R[1, 2]), float(R[1, 1])))
+            ry = np.degrees(np.arctan2(-float(R[2, 0]), sy))
+            rz = 0.0
+        tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+        text = f"ID{oid}  R({rx:.0f},{ry:.0f},{rz:.0f})  T({tx:.1f},{ty:.1f},{tz:.1f})"
+        yy = y0 + row * line_h
+        cv2.putText(vis, text, (x0, yy), fnt, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(vis, text, (x0, yy), fnt, 0.48, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+def _pose_to_euler_zyx_deg(rvec: np.ndarray) -> tuple[float, float, float]:
     R, _ = cv2.Rodrigues(rvec)
     sy = float(np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2))
     if sy > 1e-6:
-        rx = np.degrees(np.arctan2(float(R[2, 1]), float(R[2, 2])))
-        ry = np.degrees(np.arctan2(-float(R[2, 0]), sy))
-        rz = np.degrees(np.arctan2(float(R[1, 0]), float(R[0, 0])))
+        rx = float(np.degrees(np.arctan2(float(R[2, 1]), float(R[2, 2]))))
+        ry = float(np.degrees(np.arctan2(-float(R[2, 0]), sy)))
+        rz = float(np.degrees(np.arctan2(float(R[1, 0]), float(R[0, 0]))))
     else:
-        rx = np.degrees(np.arctan2(-float(R[1, 2]), float(R[1, 1])))
-        ry = np.degrees(np.arctan2(-float(R[2, 0]), sy))
+        rx = float(np.degrees(np.arctan2(-float(R[1, 2]), float(R[1, 1]))))
+        ry = float(np.degrees(np.arctan2(-float(R[2, 0]), sy)))
         rz = 0.0
-    tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
-    label_r = f"ID{obj_id} R({rx:.0f},{ry:.0f},{rz:.0f}) degree"
-    label_t = f"ID{obj_id} T({tx:.1f},{ty:.1f},{tz:.1f})"
-    (tw_r, th_r), _ = cv2.getTextSize(label_r, fnt, 0.42, 1)
-    (tw_t, th_t), _ = cv2.getTextSize(label_t, fnt, 0.42, 1)
-    tw = max(tw_r, tw_t)
-    th = th_r + th_t + 6
-    ox, oy = origin
-    cv2.rectangle(vis, (ox, oy - th - 4), (ox + tw + 2, oy + 2), (0, 0, 0), -1)
-    cv2.putText(vis, label_r, (ox + 1, oy - th_t - 4), fnt, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(vis, label_t, (ox + 1, oy - 1), fnt, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+    return rx, ry, rz
+
+
+def _next_pose_csv_path(base_dir: Path) -> Path:
+    """Return first available posesN.csv path in base_dir."""
+    i = 1
+    while True:
+        p = base_dir / f"poses{i}.csv"
+        if not p.exists():
+            return p
+        i += 1
 
 
 def _draw_registration_debug(
@@ -966,6 +832,39 @@ def _draw_registration_debug(
     if poly.shape[0] >= 3:
         cv2.polylines(canvas, [poly], True, (255, 255, 255), 2, lineType=cv2.LINE_AA)  # white = PnP quad
 
+    # Visualize 32 contour points on object mask and projected mesh silhouette.
+    n = int(est._pnp_n)
+    mask_pts = _sample_mask_contour((mask_bool.astype(np.uint8) * 255), n)
+    mesh_pts = _sample_mask_contour(pred_mask, n)
+    if mask_pts is not None and mesh_pts is not None:
+        # Cyan = object mask contour samples, Magenta = projected mesh contour samples.
+        for p in mask_pts:
+            u, v = int(round(float(p[0]))), int(round(float(p[1])))
+            cv2.circle(canvas, (u, v), 2, (255, 255, 0), -1, lineType=cv2.LINE_AA)
+        for p in mesh_pts:
+            u, v = int(round(float(p[0]))), int(round(float(p[1])))
+            cv2.circle(canvas, (u, v), 2, (255, 0, 255), -1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"Contour pts={n}",
+            (12, 20 + 18 * max(0, obj_id - 1)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            f"Contour pts={n}",
+            (12, 20 + 18 * max(0, obj_id - 1)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
     # IoU between projected model polygon and SAM mask.
     pred_b = pred_mask > 0
     sam_b = mask_bool
@@ -981,18 +880,6 @@ def _draw_registration_debug(
     text = f"ID{obj_id} reg IoU={iou:.3f} (rigid)"
     cv2.putText(canvas, text, (tx + 8, ty + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(canvas, text, (tx + 8, ty + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-
-
-# ---------------------------------------------------------------------------
-# SAM3D background worker — commented out (fal-ai dependency removed)
-# ---------------------------------------------------------------------------
-#
-# class Sam3DWorker:
-#     def __init__(self, output_dir, fal_key=None): ...
-#     def trigger(self, frame, masks): ...
-#     def get_status(self): ...
-#     def pop_new_glbs(self): ...
-#     def _run(self, frame, masks): ...  # uploads to fal-ai/sam-3/3d-objects
 
 
 # ---------------------------------------------------------------------------
@@ -1082,12 +969,12 @@ def run(args) -> None:
     predictor = _load_predictor(device)
     mesh_estimators = _load_mesh_estimators()
     if trimesh is None:
-        print("`trimesh` not installed; pose axes unavailable (cube fallback).")
+        print("`trimesh` not installed; mesh-based pose overlays unavailable.")
     elif mesh_estimators:
         loaded = ", ".join(f"ID{k}->object_{k-1}" for k in sorted(mesh_estimators))
         print(f"Pose estimators loaded for {loaded}")
     else:
-        print("No mesh files found; using mask-only cube proportions.")
+        print("No mesh files found; pose overlays disabled.")
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -1156,10 +1043,16 @@ def run(args) -> None:
     if args.output:
         h, w = TARGET_SIZE[1], TARGET_SIZE[0]
         writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (w, h))
+    csv_path = _next_pose_csv_path(Path.cwd())
+    csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(
+        ["frame_idx", "time_s", "object_id", "rx_deg", "ry_deg", "rz_deg", "tx", "ty", "tz"]
+    )
+    print(f"Pose CSV export: {csv_path}")
 
     com_trails: dict[int, list[tuple[int, int]]] = {}  # obj_id -> list of (x, y) COM positions
     pose_states: dict[int, dict] = {}          # per-obj state for MeshPoseEstimator
-    cube_states: dict[int, dict | None] = {}   # fallback cube state (no mesh)
     fps_t0 = time.perf_counter()
     fps_frames = 0
     ac_device, ac_dtype, ac_enabled = _autocast_config(device, args.half)
@@ -1197,10 +1090,8 @@ def run(args) -> None:
                                 K_cam,
                                 dist_cam,
                                 pose_states.get(oid),
-                                timestamp_s=time.perf_counter(),
-                                one_euro_min_cutoff=args.one_euro_min_cutoff,
-                                one_euro_beta=args.one_euro_beta,
-                                one_euro_d_cutoff=args.one_euro_d_cutoff,
+                                kalman_process_var=args.kalman_process_var,
+                                kalman_meas_var=args.kalman_meas_var,
                             )
                             _draw_pose_axes(
                                 vis, pose_states[oid], K_cam, dist_cam,
@@ -1211,22 +1102,38 @@ def run(args) -> None:
                                     debug_canvas, binm, pose_states[oid], est, K_cam, dist_cam, oid
                                 )
                         else:
-                            # Fallback disabled: do not draw per-object bounding-box cubes.
-                            # cube_states[oid] = _draw_3d_cube_from_mask(
-                            #     vis, binm, oid, cube_states.get(oid),
-                            #     mesh_dims=None,
-                            #     smooth_alpha=0.8,
-                            # )
-                            pass
+                            continue
 
                 # Draw COM trails
                 for oid, trail in com_trails.items():
                     col = point_color(oid)
                     for j in range(1, len(trail)):
-                        cv2.line(vis, trail[j - 1], trail[j], col, 2, lineType=cv2.LINE_AA)
+                        cv2.line(vis, trail[j - 1], trail[j], col, 1, lineType=cv2.LINE_AA)
                     if trail:
                         cv2.circle(vis, trail[-1], 5, col, -1)
                         cv2.circle(vis, trail[-1], 7, (255, 255, 255), 1)
+                        cv2.putText(
+                            vis,
+                            f"ID{oid}",
+                            (trail[-1][0] + 8, trail[-1][1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        cv2.putText(
+                            vis,
+                            f"ID{oid}",
+                            (trail[-1][0] + 8, trail[-1][1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            col,
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+                _draw_pose_hud(vis, pose_states)
 
                 if fi == 0:
                     for oid, px, py in points:
@@ -1239,6 +1146,16 @@ def run(args) -> None:
                     writer.write(vis)
                 if debug_canvas is not None:
                     cv2.imwrite(args.align_debug_out, debug_canvas)
+                t_s = float(time.perf_counter())
+                for oid in sorted(pose_states):
+                    st = pose_states.get(oid, {})
+                    rvec = st.get("rvec")
+                    tvec = st.get("tvec")
+                    if rvec is None or tvec is None:
+                        continue
+                    rx, ry, rz = _pose_to_euler_zyx_deg(rvec)
+                    tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+                    csv_writer.writerow([int(fi), t_s, int(oid), rx, ry, rz, tx, ty, tz])
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -1257,6 +1174,7 @@ def run(args) -> None:
         cap.release()
         if writer is not None:
             writer.release()
+        csv_file.close()
         cv2.destroyAllWindows()
 
 
@@ -1268,12 +1186,10 @@ def main() -> None:
                         choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--alpha", type=float, default=0.45,
                         help="Mask overlay alpha")
-    parser.add_argument("--one-euro-min-cutoff", type=float, default=ONE_EURO_MIN_CUTOFF,
-                        help="One Euro filter min cutoff (Hz-ish); higher = less smoothing")
-    parser.add_argument("--one-euro-beta", type=float, default=ONE_EURO_BETA,
-                        help="One Euro speed coefficient; higher = more responsive motion")
-    parser.add_argument("--one-euro-d-cutoff", type=float, default=ONE_EURO_D_CUTOFF,
-                        help="One Euro derivative cutoff (Hz-ish)")
+    parser.add_argument("--kalman-process-var", type=float, default=KALMAN_PROCESS_VAR,
+                        help="Kalman process variance Q (higher = more responsive, less smooth)")
+    parser.add_argument("--kalman-meas-var", type=float, default=KALMAN_MEAS_VAR,
+                        help="Kalman measurement variance R (higher = smoother, slower)")
     parser.add_argument("--half", action="store_true", default=True,
                         help="Use half-precision autocast (default: on)")
     parser.add_argument("--no-half", dest="half", action="store_false")
@@ -1284,7 +1200,6 @@ def main() -> None:
         default="",
         help="Optional path to save registration-debug image (SAM mask vs projected GLB) each frame.",
     )
-    # --sam3d / --fal-key removed (fal-ai integration commented out)
     args = parser.parse_args()
     run(args)
 
