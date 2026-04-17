@@ -255,10 +255,40 @@ def _order_corners_clockwise(corners: np.ndarray) -> np.ndarray:
 
 
 def _camera_matrix_for_frame(width: int, height: int) -> np.ndarray:
-    # Approximate intrinsics for projection-only overlay.
-    f = 1.2 * max(width, height)
+    # Fallback intrinsics used only by the cube overlay path (no cap available).
+    # Assumes 65° horizontal FOV — covers most webcams and phone cameras.
+    f = width / (2.0 * np.tan(np.radians(65.0) / 2.0))
     return np.array(
         [[f, 0.0, width / 2.0], [0.0, f, height / 2.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _estimate_intrinsics_from_cap(
+    cap: cv2.VideoCapture, target_w: int, target_h: int
+) -> np.ndarray:
+    """
+    Estimate camera intrinsic matrix without an external calibration file.
+
+    Queries the VideoCapture for its native frame dimensions, then applies a
+    65° horizontal FOV assumption — a reasonable default for most webcams and
+    smartphone wide cameras in video mode.  The focal length is scaled to
+    match the resized inference resolution (TARGET_SIZE), so this stays
+    consistent regardless of native resolution or whether the camera is an
+    Orbbec, iPhone, or standard webcam.
+    """
+    native_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    native_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    if native_w <= 0 or native_h <= 0:
+        native_w, native_h = float(target_w), float(target_h)
+
+    # fx = (native_w / 2) / tan(hfov/2), then scale down to target resolution.
+    hfov_rad = np.radians(65.0)
+    fx_native = native_w / (2.0 * np.tan(hfov_rad / 2.0))
+    f = fx_native * (target_w / native_w)
+
+    return np.array(
+        [[f, 0.0, target_w / 2.0], [0.0, f, target_h / 2.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
 
@@ -561,8 +591,8 @@ def _load_mesh_estimators() -> dict[int, MeshPoseEstimator]:
     base = Path(__file__).parent
     id_to_glb = {
         1: base / "object_0.glb",
-        # 2: base / "object_1.glb",
-        # 3: base / "object_2.glb",
+        2: base / "object_1.glb",
+        3: base / "object_2.glb",
     }
     for obj_id, p in id_to_glb.items():
         if not p.exists():
@@ -623,11 +653,17 @@ def _draw_pose_axes(
         rx = np.degrees(np.arctan2(-float(R[1, 2]), float(R[1, 1])))
         ry = np.degrees(np.arctan2(-float(R[2, 0]), sy))
         rz = 0.0
-    label = f"ID{obj_id} ({rx:.0f},{ry:.0f},{rz:.0f}) degree"
-    (tw, th), _ = cv2.getTextSize(label, fnt, 0.42, 1)
+    tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+    label_r = f"ID{obj_id} R({rx:.0f},{ry:.0f},{rz:.0f}) degree"
+    label_t = f"ID{obj_id} T({tx:.1f},{ty:.1f},{tz:.1f})"
+    (tw_r, th_r), _ = cv2.getTextSize(label_r, fnt, 0.42, 1)
+    (tw_t, th_t), _ = cv2.getTextSize(label_t, fnt, 0.42, 1)
+    tw = max(tw_r, tw_t)
+    th = th_r + th_t + 6
     ox, oy = origin
     cv2.rectangle(vis, (ox, oy - th - 4), (ox + tw + 2, oy + 2), (0, 0, 0), -1)
-    cv2.putText(vis, label, (ox + 1, oy - 1), fnt, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(vis, label_r, (ox + 1, oy - th_t - 4), fnt, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(vis, label_t, (ox + 1, oy - 1), fnt, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -736,10 +772,6 @@ def run(args) -> None:
     else:
         print("No mesh files found; using mask-only cube proportions.")
 
-    # Approximate camera intrinsics (updated once we have the first frame)
-    K_cam    = _camera_matrix_for_frame(TARGET_SIZE[0], TARGET_SIZE[1])
-    dist_cam = np.zeros((4, 1), dtype=np.float64)
-
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"Could not open camera {args.camera}")
@@ -747,6 +779,16 @@ def run(args) -> None:
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize camera-side frame queue
     rotate_180 = detect_orbbec_camera(args.camera)
     print(f"Camera {args.camera}: {'Orbbec detected, rotating 180°' if rotate_180 else 'non-Orbbec, no rotation'}")
+
+    # Estimate camera intrinsics from the native capture resolution.
+    # No calibration file needed — adapts to Orbbec, iPhone, or any webcam.
+    K_cam    = _estimate_intrinsics_from_cap(cap, TARGET_SIZE[0], TARGET_SIZE[1])
+    dist_cam = np.zeros((4, 1), dtype=np.float64)
+    print(
+        f"Camera intrinsics (estimated): "
+        f"fx={K_cam[0, 0]:.1f}  fy={K_cam[1, 1]:.1f}  "
+        f"cx={K_cam[0, 2]:.1f}  cy={K_cam[1, 2]:.1f}"
+    )
 
     image_size = predictor.image_size
     provider = LiveFrameProvider(cap, image_size, rotate_180)
@@ -842,12 +884,13 @@ def run(args) -> None:
                                 est.axis_pts, oid,
                             )
                         else:
-                            # Fallback: bounding-box cube (no mesh loaded)
-                            cube_states[oid] = _draw_3d_cube_from_mask(
-                                vis, binm, oid, cube_states.get(oid),
-                                mesh_dims=None,
-                                smooth_alpha=args.axis_smooth,
-                            )
+                            # Fallback disabled: do not draw per-object bounding-box cubes.
+                            # cube_states[oid] = _draw_3d_cube_from_mask(
+                            #     vis, binm, oid, cube_states.get(oid),
+                            #     mesh_dims=None,
+                            #     smooth_alpha=args.axis_smooth,
+                            # )
+                            pass
 
                 # Draw COM trails
                 for oid, trail in com_trails.items():
