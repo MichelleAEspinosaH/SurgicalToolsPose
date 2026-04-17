@@ -554,23 +554,25 @@ class MeshPoseEstimator:
 
 
 def _load_mesh_estimators() -> dict[int, MeshPoseEstimator]:
-    """Load per-object GLB meshes and build MeshPoseEstimators (IDs 1..3)."""
+    """Load per-object GLB meshes with fixed mapping: ID1/2/3 -> object_0/1/2.glb."""
     estimators: dict[int, MeshPoseEstimator] = {}
     if trimesh is None:
         return estimators
     base = Path(__file__).parent
-    for obj_id in (1, 2, 3):
-        stem = f"object_{obj_id - 1}"
-        for ext in (".glb", ".ply"):
-            p = base / (stem + ext)
-            if not p.exists():
-                continue
-            try:
-                mesh = trimesh.load(str(p), force="mesh")
-                estimators[obj_id] = MeshPoseEstimator(mesh)
-                break
-            except Exception:
-                continue
+    id_to_glb = {
+        1: base / "object_0.glb",
+        # 2: base / "object_1.glb",
+        # 3: base / "object_2.glb",
+    }
+    for obj_id, p in id_to_glb.items():
+        if not p.exists():
+            print(f"Missing mesh for ID{obj_id}: {p.name}")
+            continue
+        try:
+            mesh = trimesh.load(str(p), force="mesh")
+            estimators[obj_id] = MeshPoseEstimator(mesh)
+        except Exception as e:
+            print(f"Failed to load {p.name} for ID{obj_id}: {e}")
     return estimators
 
 
@@ -621,7 +623,7 @@ def _draw_pose_axes(
         rx = np.degrees(np.arctan2(-float(R[1, 2]), float(R[1, 1])))
         ry = np.degrees(np.arctan2(-float(R[2, 0]), sy))
         rz = 0.0
-    label = f"ID{obj_id} ({rx:.0f},{ry:.0f},{rz:.0f})\u00b0"
+    label = f"ID{obj_id} ({rx:.0f},{ry:.0f},{rz:.0f}) degree"
     (tw, th), _ = cv2.getTextSize(label, fnt, 0.42, 1)
     ox, oy = origin
     cv2.rectangle(vis, (ox, oy - th - 4), (ox + tw + 2, oy + 2), (0, 0, 0), -1)
