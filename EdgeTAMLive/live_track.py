@@ -226,27 +226,204 @@ def _estimate_intrinsics_from_cap(
     """
     Estimate camera intrinsic matrix without an external calibration file.
 
-    Queries the VideoCapture for its native frame dimensions, then applies a
-    65° horizontal FOV assumption — a reasonable default for most webcams and
-    smartphone wide cameras in video mode.  The focal length is scaled to
-    match the resized inference resolution (TARGET_SIZE), so this stays
-    consistent regardless of native resolution or whether the camera is an
-    Orbbec, iPhone, or standard webcam.
+    Queries the VideoCapture for its native frame dimensions, then applies the
+    Orbbec IR FOV spec (H=79°, V=62°). Focal lengths are computed on the native
+    sensor size and scaled to the resized inference resolution (TARGET_SIZE).
     """
     native_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     native_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     if native_w <= 0 or native_h <= 0:
         native_w, native_h = float(target_w), float(target_h)
 
-    # fx = (native_w / 2) / tan(hfov/2), then scale down to target resolution.
-    hfov_rad = np.radians(65.0)
+    # Use separate focal lengths from spec FOV:
+    # fx = (w/2)/tan(hfov/2), fy = (h/2)/tan(vfov/2), then scale to target size.
+    hfov_rad = np.radians(79.0)
+    vfov_rad = np.radians(62.0)
     fx_native = native_w / (2.0 * np.tan(hfov_rad / 2.0))
-    f = fx_native * (target_w / native_w)
+    fy_native = native_h / (2.0 * np.tan(vfov_rad / 2.0))
+    fx = fx_native * (target_w / native_w)
+    fy = fy_native * (target_h / native_h)
 
     return np.array(
-        [[f, 0.0, target_w / 2.0], [0.0, f, target_h / 2.0], [0.0, 0.0, 1.0]],
+        [[fx, 0.0, target_w / 2.0], [0.0, fy, target_h / 2.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
+
+
+def _rescale_intrinsics(
+    K: np.ndarray,
+    src_w: float,
+    src_h: float,
+    dst_w: int,
+    dst_h: int,
+) -> np.ndarray:
+    """Rescale intrinsic matrix when image resolution changes."""
+    sx = float(dst_w) / max(float(src_w), 1e-9)
+    sy = float(dst_h) / max(float(src_h), 1e-9)
+    K2 = np.asarray(K, dtype=np.float64).copy()
+    K2[0, 0] *= sx  # fx
+    K2[1, 1] *= sy  # fy
+    K2[0, 2] *= sx  # cx
+    K2[1, 2] *= sy  # cy
+    return K2
+
+
+def _load_intrinsics_from_file(
+    path: str,
+    target_w: int,
+    target_h: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Load camera intrinsics from .npz.
+
+    Supported keys:
+      - K / camera_matrix / intrinsics  (3x3)
+      - dist / dist_coeffs / distortion (optional)
+      - width,height or image_width,image_height (optional, for rescaling)
+    """
+    try:
+        data = np.load(path, allow_pickle=False)
+    except Exception as e:
+        print(f"Failed to load intrinsics file '{path}': {e}")
+        return None
+
+    K = None
+    for kname in ("K", "camera_matrix", "intrinsics"):
+        if kname in data:
+            cand = np.asarray(data[kname], dtype=np.float64)
+            if cand.shape == (3, 3):
+                K = cand
+                break
+    if K is None:
+        print(
+            f"Intrinsics file '{path}' is missing a 3x3 matrix "
+            f"(expected one of: K, camera_matrix, intrinsics)."
+        )
+        return None
+
+    dist = np.zeros((4, 1), dtype=np.float64)
+    for dname in ("dist", "dist_coeffs", "distortion"):
+        if dname in data:
+            d = np.asarray(data[dname], dtype=np.float64).reshape(-1, 1)
+            if d.size > 0:
+                dist = d
+            break
+
+    src_w = src_h = None
+    if "width" in data and "height" in data:
+        src_w = float(np.asarray(data["width"]).reshape(-1)[0])
+        src_h = float(np.asarray(data["height"]).reshape(-1)[0])
+    elif "image_width" in data and "image_height" in data:
+        src_w = float(np.asarray(data["image_width"]).reshape(-1)[0])
+        src_h = float(np.asarray(data["image_height"]).reshape(-1)[0])
+
+    if src_w is not None and src_h is not None and src_w > 0 and src_h > 0:
+        K = _rescale_intrinsics(K, src_w, src_h, target_w, target_h)
+
+    return K.astype(np.float64), dist.astype(np.float64)
+
+
+def _try_read_orbbec_intrinsics(
+    target_w: int,
+    target_h: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Try reading Orbbec color intrinsics via pyorbbecsdk.
+
+    Returns (K, dist) in TARGET_SIZE scale when available, else None.
+    """
+    try:
+        from pyorbbecsdk import Config, OBSensorType, Pipeline  # type: ignore
+    except Exception:
+        return None
+
+    pipeline = None
+    try:
+        pipeline = Pipeline()
+        config = Config()
+        profile_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        if profile_list is None:
+            return None
+        color_profile = profile_list.get_default_video_stream_profile()
+        if color_profile is None:
+            return None
+
+        native_w = float(color_profile.get_width())
+        native_h = float(color_profile.get_height())
+
+        intr = None
+        if hasattr(color_profile, "get_intrinsic"):
+            intr = color_profile.get_intrinsic()
+        elif hasattr(color_profile, "get_camera_intrinsic"):
+            intr = color_profile.get_camera_intrinsic()
+
+        if intr is None:
+            return None
+
+        fx = float(getattr(intr, "fx", 0.0))
+        fy = float(getattr(intr, "fy", 0.0))
+        cx = float(getattr(intr, "cx", native_w / 2.0))
+        cy = float(getattr(intr, "cy", native_h / 2.0))
+        if fx <= 0 or fy <= 0:
+            return None
+
+        K_native = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        K = _rescale_intrinsics(K_native, native_w, native_h, target_w, target_h)
+
+        # Distortion is optional in SDK wrappers; use zeros if unavailable.
+        dist = np.zeros((4, 1), dtype=np.float64)
+        if hasattr(intr, "coeffs"):
+            coeffs = np.asarray(getattr(intr, "coeffs"), dtype=np.float64).reshape(-1, 1)
+            if coeffs.size > 0:
+                dist = coeffs
+        else:
+            vals = []
+            for name in ("k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"):
+                if hasattr(intr, name):
+                    vals.append(float(getattr(intr, name)))
+            if vals:
+                dist = np.asarray(vals, dtype=np.float64).reshape(-1, 1)
+        return K, dist
+    except Exception:
+        return None
+    finally:
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+
+
+def _resolve_pose_intrinsics(
+    cap: cv2.VideoCapture,
+    target_w: int,
+    target_h: int,
+    intrinsics_file: str,
+    try_orbbec_intrinsics: bool,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    Resolve pose intrinsics in priority order:
+      1) user-provided intrinsics file
+      2) Orbbec SDK-reported intrinsics (if enabled/available)
+      3) FOV-based estimate fallback
+    """
+    if intrinsics_file:
+        loaded = _load_intrinsics_from_file(intrinsics_file, target_w, target_h)
+        if loaded is not None:
+            return loaded[0], loaded[1], f"file:{intrinsics_file}"
+        print("Falling back because intrinsics file could not be used.")
+
+    if try_orbbec_intrinsics:
+        sdk_loaded = _try_read_orbbec_intrinsics(target_w, target_h)
+        if sdk_loaded is not None:
+            return sdk_loaded[0], sdk_loaded[1], "orbbec_sdk"
+
+    K = _estimate_intrinsics_from_cap(cap, target_w, target_h)
+    dist = np.zeros((4, 1), dtype=np.float64)
+    return K, dist, "fov_estimate"
 
 def _mesh_projection_iou(
     mask_bool: np.ndarray,
@@ -733,7 +910,9 @@ def _draw_pose_hud(vis: np.ndarray, pose_states: dict[int, dict]) -> None:
     for row, oid in enumerate(sorted(pose_states)):
         st = pose_states.get(oid, {})
         rvec = st.get("rvec")
-        tvec = st.get("tvec")
+        tvec = st.get("tvec_cal")
+        if tvec is None:
+            tvec = st.get("tvec")
         if rvec is None or tvec is None:
             continue
         # Euler angles (ZYX) for readout
@@ -752,6 +931,38 @@ def _draw_pose_hud(vis: np.ndarray, pose_states: dict[int, dict]) -> None:
         yy = y0 + row * line_h
         cv2.putText(vis, text, (x0, yy), fnt, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(vis, text, (x0, yy), fnt, 0.48, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+def _update_translation_calibration_from_surface(
+    state: dict,
+    surface_distance_cm: float,
+    ema_alpha: float = 0.15,
+) -> None:
+    """
+    Build a calibrated translation readout from known camera->surface distance.
+
+    This keeps raw ``tvec`` untouched for rendering/projection consistency and
+    stores a calibrated copy in ``tvec_cal`` for HUD/CSV readouts.
+    """
+    if surface_distance_cm <= 0:
+        return
+    tvec = state.get("tvec")
+    if tvec is None:
+        return
+
+    tz_raw = abs(float(tvec[2]))
+    if tz_raw < 1e-9:
+        return
+
+    scale_now = float(surface_distance_cm) / tz_raw
+    prev = state.get("tvec_cal_scale")
+    if prev is None:
+        scale = scale_now
+    else:
+        scale = (1.0 - ema_alpha) * float(prev) + ema_alpha * scale_now
+
+    state["tvec_cal_scale"] = scale
+    state["tvec_cal"] = np.asarray(tvec, dtype=np.float64) * scale
 
 
 def _pose_to_euler_zyx_deg(rvec: np.ndarray) -> tuple[float, float, float]:
@@ -984,15 +1195,23 @@ def run(args) -> None:
     rotate_180 = detect_orbbec_camera(args.camera)
     print(f"Camera {args.camera}: {'Orbbec detected, rotating 180°' if rotate_180 else 'non-Orbbec, no rotation'}")
 
-    # Estimate camera intrinsics from the native capture resolution.
-    # No calibration file needed — adapts to Orbbec, iPhone, or any webcam.
-    K_cam    = _estimate_intrinsics_from_cap(cap, TARGET_SIZE[0], TARGET_SIZE[1])
-    dist_cam = np.zeros((4, 1), dtype=np.float64)
+    # Resolve intrinsics for pose (file > Orbbec SDK > FOV estimate fallback).
+    K_cam, dist_cam, intr_src = _resolve_pose_intrinsics(
+        cap,
+        TARGET_SIZE[0],
+        TARGET_SIZE[1],
+        args.intrinsics_file,
+        not args.no_orbbec_intrinsics,
+    )
     print(
-        f"Camera intrinsics (estimated): "
+        f"Camera intrinsics ({intr_src}): "
         f"fx={K_cam[0, 0]:.1f}  fy={K_cam[1, 1]:.1f}  "
         f"cx={K_cam[0, 2]:.1f}  cy={K_cam[1, 2]:.1f}"
     )
+    if dist_cam.size > 0:
+        dflat = dist_cam.reshape(-1)
+        preview = ", ".join(f"{x:.4g}" for x in dflat[:5])
+        print(f"Distortion coeffs ({len(dflat)}): [{preview}{' ...' if len(dflat) > 5 else ''}]")
 
     image_size = predictor.image_size
     provider = LiveFrameProvider(cap, image_size, rotate_180)
@@ -1046,10 +1265,16 @@ def run(args) -> None:
     csv_path = _next_pose_csv_path(Path.cwd())
     csv_file = open(csv_path, "w", newline="", encoding="utf-8")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(
-        ["frame_idx", "time_s", "object_id", "rx_deg", "ry_deg", "rz_deg", "tx", "ty", "tz"]
-    )
+    t_cols = ["tx", "ty", "tz"]
+    if args.surface_distance_cm > 0:
+        t_cols = ["tx_cm", "ty_cm", "tz_cm"]
+    csv_writer.writerow(["frame_idx", "time_s", "object_id", "rx_deg", "ry_deg", "rz_deg", *t_cols])
     print(f"Pose CSV export: {csv_path}")
+    if args.surface_distance_cm > 0:
+        print(
+            f"Translation calibration enabled: using camera->surface distance "
+            f"{args.surface_distance_cm:.2f} cm for T readouts/CSV."
+        )
 
     com_trails: dict[int, list[tuple[int, int]]] = {}  # obj_id -> list of (x, y) COM positions
     pose_states: dict[int, dict] = {}          # per-obj state for MeshPoseEstimator
@@ -1093,6 +1318,10 @@ def run(args) -> None:
                                 kalman_process_var=args.kalman_process_var,
                                 kalman_meas_var=args.kalman_meas_var,
                             )
+                            if args.surface_distance_cm > 0:
+                                _update_translation_calibration_from_surface(
+                                    pose_states[oid], args.surface_distance_cm
+                                )
                             _draw_pose_axes(
                                 vis, pose_states[oid], K_cam, dist_cam,
                                 est.axis_pts, oid,
@@ -1150,7 +1379,9 @@ def run(args) -> None:
                 for oid in sorted(pose_states):
                     st = pose_states.get(oid, {})
                     rvec = st.get("rvec")
-                    tvec = st.get("tvec")
+                    tvec = st.get("tvec_cal")
+                    if tvec is None:
+                        tvec = st.get("tvec")
                     if rvec is None or tvec is None:
                         continue
                     rx, ry, rz = _pose_to_euler_zyx_deg(rvec)
@@ -1195,6 +1426,29 @@ def main() -> None:
     parser.add_argument("--no-half", dest="half", action="store_false")
     parser.add_argument("--output", default="",
                         help="Optional path to save output video (e.g. out.mp4)")
+    parser.add_argument(
+        "--intrinsics-file",
+        default="",
+        help=(
+            "Optional .npz intrinsics file for pose calibration. "
+            "Expected keys: K (or camera_matrix/intrinsics), optional dist/dist_coeffs, "
+            "optional width,height."
+        ),
+    )
+    parser.add_argument(
+        "--no-orbbec-intrinsics",
+        action="store_true",
+        help="Disable attempting to read Orbbec SDK color intrinsics before fallback estimate.",
+    )
+    parser.add_argument(
+        "--surface-distance-cm",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional known camera-to-surface distance in cm. "
+            "When > 0, T(x,y,z) HUD/CSV are scaled to this reference."
+        ),
+    )
     parser.add_argument(
         "--align-debug-out",
         default="",
