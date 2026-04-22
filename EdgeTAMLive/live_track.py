@@ -26,6 +26,8 @@ import sys
 import tempfile
 import threading
 import time
+import json
+from urllib.request import urlretrieve
 from pathlib import Path
 
 import cv2
@@ -795,6 +797,8 @@ class MeshPoseEstimator:
                     best_key = (key[0], key[1])
                     best_rv, best_tv, best_s = rv, tv, s.copy()
                     best_shift = shift
+                if iou >= 0.75:
+                    break
             if best_rv is None or best_s is None:
                 return state
             state["reg_sign"] = best_s
@@ -861,6 +865,76 @@ def _load_mesh_estimators() -> dict[int, MeshPoseEstimator]:
     return estimators
 
 
+def _bootstrap_sam3d_estimators(
+    seed_frame_bgr: np.ndarray,
+    ids: list[int],
+    masks_np: np.ndarray,
+    output_dir: Path,
+    fal_model: str,
+) -> tuple[dict[int, MeshPoseEstimator], dict[int, dict]]:
+    """
+    Run SAM3D once on the initial frozen frame and return per-ID mesh estimators.
+    """
+    if trimesh is None:
+        print("`trimesh` not installed; cannot load SAM3D GLBs for pose.")
+        return {}, {}
+    if not os.environ.get("FAL_KEY"):
+        print("FAL_KEY is not set; cannot call SAM3D API.")
+        return {}, {}
+    try:
+        import fal_client  # type: ignore
+    except Exception as e:
+        print(f"`fal-client` import failed: {e}")
+        return {}, {}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    seed_path = output_dir / "seed_frame.png"
+    cv2.imwrite(str(seed_path), seed_frame_bgr)
+    image_url = fal_client.upload_file(str(seed_path))
+    print(f"SAM3D bootstrap: uploaded seed frame ({seed_path.name})")
+
+    estimators: dict[int, MeshPoseEstimator] = {}
+    payload: dict[int, dict] = {}
+    fh, fw = seed_frame_bgr.shape[:2]
+    for i in range(min(len(ids), masks_np.shape[0])):
+        oid = int(ids[i])
+        binm = _mask_to_2d_bool(masks_np[i], fh, fw).astype(np.uint8)
+        if not np.any(binm):
+            print(f"[ID{oid}] Empty mask on seed frame; skipping SAM3D.")
+            continue
+        mask_path = output_dir / f"object_{oid}_mask.png"
+        cv2.imwrite(str(mask_path), binm * 255)
+        try:
+            mask_url = fal_client.upload_file(str(mask_path))
+            result = fal_client.subscribe(
+                fal_model,
+                arguments={"image_url": image_url, "mask_urls": [mask_url], "seed": 42},
+                with_logs=True,
+            )
+            model_glb = result.get("model_glb", {}) if isinstance(result, dict) else {}
+            glb_url = model_glb.get("url")
+            if not isinstance(glb_url, str) or not glb_url:
+                print(f"[ID{oid}] SAM3D returned no model_glb.")
+                continue
+            glb_path = output_dir / f"object_{oid}.glb"
+            urlretrieve(glb_url, glb_path)
+            mesh = trimesh.load(str(glb_path), force="mesh")
+            estimators[oid] = MeshPoseEstimator(mesh)
+            payload[oid] = {
+                "mask_path": str(mask_path),
+                "glb_path": str(glb_path),
+                "fal_result": result,
+            }
+            print(f"[ID{oid}] SAM3D GLB ready: {glb_path.name}")
+        except Exception as e:
+            print(f"[ID{oid}] SAM3D bootstrap failed: {e}")
+    if payload:
+        (output_dir / "sam3d_bootstrap.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+    return estimators, payload
+
+
 def _draw_pose_axes(
     vis: np.ndarray,
     state: dict,
@@ -870,6 +944,7 @@ def _draw_pose_axes(
     obj_id: int,
 ) -> None:
     """Project and draw X(red)/Y(green)/Z(blue) pose axes."""
+    max_arrow_px = 40.0
     rvec = state.get("rvec")
     tvec = state.get("tvec")
     if rvec is None or tvec is None:
@@ -885,10 +960,24 @@ def _draw_pose_axes(
     def clip_pt(p: np.ndarray) -> tuple[int, int]:
         return (int(np.clip(p[0], 0, fw - 1)), int(np.clip(p[1], 0, fh - 1)))
 
-    origin = clip_pt(pts2d[0])
-    x_tip  = clip_pt(pts2d[1])
-    y_tip  = clip_pt(pts2d[2])
-    z_tip  = clip_pt(pts2d[3])
+    def cap_tip_length(origin_xy: np.ndarray, tip_xy: np.ndarray) -> np.ndarray:
+        v = tip_xy - origin_xy
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            return origin_xy
+        if n > max_arrow_px:
+            v = v * (max_arrow_px / n)
+        return origin_xy + v
+
+    origin_f = pts2d[0].astype(np.float64)
+    x_tip_f = cap_tip_length(origin_f, pts2d[1].astype(np.float64))
+    y_tip_f = cap_tip_length(origin_f, pts2d[2].astype(np.float64))
+    z_tip_f = cap_tip_length(origin_f, pts2d[3].astype(np.float64))
+
+    origin = clip_pt(origin_f)
+    x_tip  = clip_pt(x_tip_f)
+    y_tip  = clip_pt(y_tip_f)
+    z_tip  = clip_pt(z_tip_f)
 
     cv2.arrowedLine(vis, origin, x_tip, (0, 0, 220),   2, tipLength=0.20, line_type=cv2.LINE_AA)
     cv2.arrowedLine(vis, origin, y_tip, (0, 200, 0),   2, tipLength=0.20, line_type=cv2.LINE_AA)
@@ -1169,6 +1258,9 @@ class LiveFrameProvider:
 
 def run(args) -> None:
     device = choose_device(args.device)
+    if device == "cpu":
+        print("GPU is required for this merged pipeline. Use --device mps or --device cuda.")
+        return
     print(f"Device: {device}")
 
     if not CHECKPOINT.exists():
@@ -1178,14 +1270,10 @@ def run(args) -> None:
 
     print("Loading EdgeTAM …")
     predictor = _load_predictor(device)
-    mesh_estimators = _load_mesh_estimators()
-    if trimesh is None:
-        print("`trimesh` not installed; mesh-based pose overlays unavailable.")
-    elif mesh_estimators:
-        loaded = ", ".join(f"ID{k}->object_{k-1}" for k in sorted(mesh_estimators))
-        print(f"Pose estimators loaded for {loaded}")
-    else:
-        print("No mesh files found; pose overlays disabled.")
+    # NOTE: old static pose-estimation mesh mapping is intentionally disabled:
+    # mesh_estimators = _load_mesh_estimators()
+    mesh_estimators: dict[int, MeshPoseEstimator] = {}
+    sam3d_bootstrapped = False
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -1251,12 +1339,21 @@ def run(args) -> None:
     state["images"] = provider
     state["num_frames"] = 1_000_000
 
+    _seed_ids: list[int] = [int(p[0]) for p in points]
+    _seed_masks_np = np.zeros((0, TARGET_SIZE[1], TARGET_SIZE[0]), dtype=np.float32)
     for obj_id, x, y in points:
-        predictor.add_new_points_or_box(
+        _out = predictor.add_new_points_or_box(
             state, frame_idx=0, obj_id=int(obj_id),
             points=np.array([[x, y]], dtype=np.float32),
             labels=np.array([1], dtype=np.int32),
         )
+        if _out is not None and len(_out) >= 3:
+            _seed_ids_raw = _out[1]
+            if hasattr(_seed_ids_raw, "tolist"):
+                _seed_ids = [int(v) for v in _seed_ids_raw.tolist()]
+            else:
+                _seed_ids = [int(v) for v in _seed_ids_raw]
+            _seed_masks_np = _out[2].detach().cpu().numpy()
 
     writer = None
     if args.output:
@@ -1296,6 +1393,23 @@ def run(args) -> None:
                 vis = overlay_masks(frame, ids, masks, alpha=args.alpha)
                 fh, fw = frame.shape[:2]
                 masks_np = masks.detach().cpu().numpy()
+                if not sam3d_bootstrapped:
+                    print("Bootstrapping SAM3D on initial frozen frame (one-time)...")
+                    bootstrap_ids = _seed_ids if len(_seed_ids) > 0 else ids
+                    bootstrap_masks_np = _seed_masks_np if _seed_masks_np.shape[0] > 0 else masks_np
+                    mesh_estimators, _ = _bootstrap_sam3d_estimators(
+                        seed_frame_bgr=seed_frame.copy() if seed_frame is not None else frame,
+                        ids=bootstrap_ids,
+                        masks_np=bootstrap_masks_np,
+                        output_dir=Path(args.sam3d_output_dir),
+                        fal_model=args.sam3d_model,
+                    )
+                    if mesh_estimators:
+                        loaded = ", ".join(f"ID{k}" for k in sorted(mesh_estimators))
+                        print(f"SAM3D mesh estimators ready for {loaded}")
+                    else:
+                        print("SAM3D bootstrap produced no estimators; pose overlays disabled.")
+                    sam3d_bootstrapped = True
                 for i in range(min(len(ids), masks_np.shape[0])):
                     oid = ids[i]
                     binm = _mask_to_2d_bool(masks_np[i], fh, fw)
@@ -1426,6 +1540,16 @@ def main() -> None:
     parser.add_argument("--no-half", dest="half", action="store_false")
     parser.add_argument("--output", default="",
                         help="Optional path to save output video (e.g. out.mp4)")
+    parser.add_argument(
+        "--sam3d-model",
+        default="fal-ai/sam-3/3d-objects",
+        help="fal SAM3D endpoint used once on the initial frozen frame.",
+    )
+    parser.add_argument(
+        "--sam3d-output-dir",
+        default=str(Path(__file__).parent / "sam3d_live_bootstrap"),
+        help="Directory for initial-frame SAM3D masks/GLBs/metadata.",
+    )
     parser.add_argument(
         "--intrinsics-file",
         default="",
