@@ -18,6 +18,7 @@ Keybindings:
 
 import argparse
 import csv
+import itertools
 import os
 import re
 import shutil
@@ -1015,7 +1016,10 @@ def _draw_pose_hud(vis: np.ndarray, pose_states: dict[int, dict]) -> None:
             rx = np.degrees(np.arctan2(-float(R[1, 2]), float(R[1, 1])))
             ry = np.degrees(np.arctan2(-float(R[2, 0]), sy))
             rz = 0.0
-        tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+        tv = np.asarray(tvec, dtype=np.float64).reshape(-1)
+        if tv.size < 3:
+            continue
+        tx, ty, tz = float(tv[0]), float(tv[1]), float(tv[2])
         text = f"ID{oid}  R({rx:.0f},{ry:.0f},{rz:.0f})  T({tx:.1f},{ty:.1f},{tz:.1f})"
         yy = y0 + row * line_h
         cv2.putText(vis, text, (x0, yy), fnt, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
@@ -1039,7 +1043,10 @@ def _update_translation_calibration_from_surface(
     if tvec is None:
         return
 
-    tz_raw = abs(float(tvec[2]))
+    tv = np.asarray(tvec, dtype=np.float64).reshape(-1)
+    if tv.size < 3:
+        return
+    tz_raw = abs(float(tv[2]))
     if tz_raw < 1e-9:
         return
 
@@ -1273,7 +1280,6 @@ def run(args) -> None:
     # NOTE: old static pose-estimation mesh mapping is intentionally disabled:
     # mesh_estimators = _load_mesh_estimators()
     mesh_estimators: dict[int, MeshPoseEstimator] = {}
-    sam3d_bootstrapped = False
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -1355,6 +1361,50 @@ def run(args) -> None:
                 _seed_ids = [int(v) for v in _seed_ids_raw]
             _seed_masks_np = _out[2].detach().cpu().numpy()
 
+    # Build propagation stream now so we can optionally pull one frame to get
+    # reliable startup masks before showing any live output.
+    prop_stream = predictor.propagate_in_video(state)
+    first_packet = None
+    need_first_packet_masks = _seed_masks_np.shape[0] == 0
+    if need_first_packet_masks:
+        try:
+            first_packet = next(prop_stream)
+        except StopIteration:
+            print("No propagated masks available for startup bootstrap. Exiting.")
+            stop_flag.set()
+            cap.release()
+            return
+        fp_ids_raw = first_packet[1]
+        if hasattr(fp_ids_raw, "tolist"):
+            _seed_ids = [int(v) for v in fp_ids_raw.tolist()]
+        else:
+            _seed_ids = [int(v) for v in fp_ids_raw]
+        _seed_masks_np = first_packet[2].detach().cpu().numpy()
+
+    # Linear startup flow:
+    # 1) points selected on frozen frame
+    # 2) wait for startup masks (seed output, or first propagated packet)
+    # 3) run one-time SAM3D bootstrap on frozen frame
+    # 4) initialize pose from startup masks
+    print("Bootstrapping SAM3D on initial frozen frame (blocking)...")
+    bootstrap_ids = _seed_ids
+    bootstrap_masks_np = _seed_masks_np
+    mesh_estimators, _ = _bootstrap_sam3d_estimators(
+        seed_frame_bgr=seed_frame.copy(),
+        ids=bootstrap_ids,
+        masks_np=bootstrap_masks_np,
+        output_dir=Path(args.sam3d_output_dir),
+        fal_model=args.sam3d_model,
+    )
+    if mesh_estimators:
+        loaded = ", ".join(f"ID{k}" for k in sorted(mesh_estimators))
+        print(f"SAM3D mesh estimators ready for {loaded}")
+    else:
+        print("SAM3D bootstrap produced no estimators; exiting to avoid mask-only run.")
+        stop_flag.set()
+        cap.release()
+        return
+
     writer = None
     if args.output:
         h, w = TARGET_SIZE[1], TARGET_SIZE[0]
@@ -1375,6 +1425,32 @@ def run(args) -> None:
 
     com_trails: dict[int, list[tuple[int, int]]] = {}  # obj_id -> list of (x, y) COM positions
     pose_states: dict[int, dict] = {}          # per-obj state for MeshPoseEstimator
+    if _seed_masks_np.shape[0] > 0 and mesh_estimators:
+        for i in range(min(len(_seed_ids), _seed_masks_np.shape[0])):
+            oid = int(_seed_ids[i])
+            est = mesh_estimators.get(oid)
+            if est is None:
+                continue
+            seed_binm = _mask_to_2d_bool(_seed_masks_np[i], TARGET_SIZE[1], TARGET_SIZE[0])
+            if not np.any(seed_binm):
+                continue
+            pose_states[oid] = est.estimate_pose(
+                seed_binm,
+                K_cam,
+                dist_cam,
+                pose_states.get(oid),
+                kalman_process_var=args.kalman_process_var,
+                kalman_meas_var=args.kalman_meas_var,
+            )
+            if args.surface_distance_cm > 0:
+                _update_translation_calibration_from_surface(
+                    pose_states[oid], args.surface_distance_cm
+                )
+        if pose_states:
+            print(
+                "Initialized frozen-frame pose anchors for "
+                + ", ".join(f"ID{k}" for k in sorted(pose_states))
+            )
     fps_t0 = time.perf_counter()
     fps_frames = 0
     ac_device, ac_dtype, ac_enabled = _autocast_config(device, args.half)
@@ -1382,7 +1458,8 @@ def run(args) -> None:
     print("Live tracking started. Press 'q' or ESC to stop.")
     try:
         with torch.autocast(device_type=ac_device, dtype=ac_dtype, enabled=ac_enabled):
-            for fi, obj_ids, masks in predictor.propagate_in_video(state):
+            stream_iter = prop_stream if first_packet is None else itertools.chain([first_packet], prop_stream)
+            for fi, obj_ids, masks in stream_iter:
                 frame = provider.get_raw(fi)
                 debug_canvas = frame.copy() if args.align_debug_out else None
                 if hasattr(obj_ids, "tolist"):
@@ -1393,23 +1470,6 @@ def run(args) -> None:
                 vis = overlay_masks(frame, ids, masks, alpha=args.alpha)
                 fh, fw = frame.shape[:2]
                 masks_np = masks.detach().cpu().numpy()
-                if not sam3d_bootstrapped:
-                    print("Bootstrapping SAM3D on initial frozen frame (one-time)...")
-                    bootstrap_ids = _seed_ids if len(_seed_ids) > 0 else ids
-                    bootstrap_masks_np = _seed_masks_np if _seed_masks_np.shape[0] > 0 else masks_np
-                    mesh_estimators, _ = _bootstrap_sam3d_estimators(
-                        seed_frame_bgr=seed_frame.copy() if seed_frame is not None else frame,
-                        ids=bootstrap_ids,
-                        masks_np=bootstrap_masks_np,
-                        output_dir=Path(args.sam3d_output_dir),
-                        fal_model=args.sam3d_model,
-                    )
-                    if mesh_estimators:
-                        loaded = ", ".join(f"ID{k}" for k in sorted(mesh_estimators))
-                        print(f"SAM3D mesh estimators ready for {loaded}")
-                    else:
-                        print("SAM3D bootstrap produced no estimators; pose overlays disabled.")
-                    sam3d_bootstrapped = True
                 for i in range(min(len(ids), masks_np.shape[0])):
                     oid = ids[i]
                     binm = _mask_to_2d_bool(masks_np[i], fh, fw)
@@ -1499,7 +1559,10 @@ def run(args) -> None:
                     if rvec is None or tvec is None:
                         continue
                     rx, ry, rz = _pose_to_euler_zyx_deg(rvec)
-                    tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+                    tv = np.asarray(tvec, dtype=np.float64).reshape(-1)
+                    if tv.size < 3:
+                        continue
+                    tx, ty, tz = float(tv[0]), float(tv[1]), float(tv[2])
                     csv_writer.writerow([int(fi), t_s, int(oid), rx, ry, rz, tx, ty, tz])
 
                 key = cv2.waitKey(1) & 0xFF
