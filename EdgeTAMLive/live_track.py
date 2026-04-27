@@ -114,6 +114,36 @@ def detect_orbbec_camera(camera_id: int) -> bool:
             return "orbbec" in name.lower()
     return False
 
+
+def _build_repeated_video_from_image(
+    image_path: Path,
+    out_path: Path,
+    num_frames: int = 100,
+    fps: float = 30.0,
+) -> Path:
+    """
+    Create an MP4 by repeating one image frame ``num_frames`` times.
+    """
+    img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    frame = cv2.resize(img, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(out_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (frame.shape[1], frame.shape[0]),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open writer for: {out_path}")
+    try:
+        for _ in range(max(1, int(num_frames))):
+            writer.write(frame)
+    finally:
+        writer.release()
+    return out_path
+
 # ---------------------------------------------------------------------------
 # Point-picking UI
 # ---------------------------------------------------------------------------
@@ -428,30 +458,6 @@ def _resolve_pose_intrinsics(
     dist = np.zeros((4, 1), dtype=np.float64)
     return K, dist, "fov_estimate"
 
-def _mesh_projection_iou(
-    mask_bool: np.ndarray,
-    verts: np.ndarray,
-    faces: np.ndarray,
-    rvec: np.ndarray,
-    tvec: np.ndarray,
-    K: np.ndarray,
-    dist: np.ndarray,
-) -> float:
-    """IoU between binary mask and mesh silhouette (filled projected faces)."""
-    fh, fw = mask_bool.shape[:2]
-    pred_mask = np.zeros((fh, fw), dtype=np.uint8)
-    proj_mesh, _ = cv2.projectPoints(verts.astype(np.float64), rvec, tvec, K, dist)
-    pts2d = proj_mesh.reshape(-1, 2)
-    for f in faces:
-        poly = np.round(pts2d[f]).astype(np.int32)
-        cv2.fillConvexPoly(pred_mask, poly, 255, lineType=cv2.LINE_AA)
-    pred_b = pred_mask > 0
-    sam_b = mask_bool
-    inter = float(np.logical_and(pred_b, sam_b).sum())
-    union = float(np.logical_or(pred_b, sam_b).sum())
-    return inter / union if union > 0.0 else 0.0
-
-
 def _reg_sign_from_state(state: dict) -> np.ndarray:
     s = state.get("reg_sign")
     if s is None:
@@ -586,15 +592,9 @@ class MeshPoseEstimator:
     """
     6DoF pose estimator for an elongated surgical tool given its 3D mesh.
 
-    Vertices live in a PCA-aligned frame (same order as columns of
-    ``mesh_vertices``):
-        axis 0  (red)   — primary / length
-        axis 1  (green) — secondary / width
-        axis 2  (blue)  — tertiary / thickness
-
-    PnP matches the mask ``minAreaRect`` to the model midplane rectangle using
-    many uniformly sampled perimeter points (see ``PNP_PER_EDGE``), seeded by
-    IPPE on four corners then refined with ``SOLVEPNP_ITERATIVE``.
+    Vertices are PCA-aligned in mesh space for a stable canonical basis.
+    PnP uses contour-to-contour correspondences with many uniformly sampled
+    points on the object mask edge and model midplane perimeter.
     """
 
     def __init__(self, mesh):
@@ -604,12 +604,12 @@ class MeshPoseEstimator:
         v = verts - cen
         cov = (v.T @ v) / len(v)
         eigvals, evecs = np.linalg.eigh(cov)
-        order = np.argsort(eigvals)[::-1]   # longest axis first
+        order = np.argsort(eigvals)[::-1]  # longest axis first
         aligned = v @ evecs[:, order]
         self.mesh_vertices = aligned.astype(np.float64)
         self.mesh_faces = faces
 
-        # Half-extents: 0=primary(length), 1=secondary(width), 2=tertiary(thickness)
+        # Half-extents in PCA-aligned coordinates.
         hP = (aligned[:, 0].max() - aligned[:, 0].min()) / 2
         hS = (aligned[:, 1].max() - aligned[:, 1].min()) / 2
         hT = (aligned[:, 2].max() - aligned[:, 2].min()) / 2
@@ -644,69 +644,72 @@ class MeshPoseEstimator:
         self._pnp_n = 4 * PNP_PER_EDGE
 
     # ------------------------------------------------------------------
-    def _pnp_best_pts(
-        self,
-        model_pts: np.ndarray,
-        img_corners: np.ndarray,
-        K: np.ndarray,
-        dist: np.ndarray,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, float]:
-        """
-        Try all 4 cyclic shifts of model_pts → img_corners correspondences
-        with IPPE + ITERATIVE.  Return (rvec, tvec, mean reprojection error).
-        """
-        best_rv, best_tv, best_err = None, None, np.inf
-        for shift in range(4):
-            pts = np.roll(model_pts, shift, axis=0)
-            for flag in (cv2.SOLVEPNP_IPPE, cv2.SOLVEPNP_ITERATIVE):
-                ok, rv, tv = cv2.solvePnP(pts, img_corners, K, dist, flags=flag)
-                if not ok:
-                    continue
-                proj, _ = cv2.projectPoints(pts, rv, tv, K, dist)
-                err = float(
-                    np.mean(np.linalg.norm(proj.reshape(-1, 2) - img_corners, axis=1))
-                )
-                if err < best_err:
-                    best_err, best_rv, best_tv = err, rv, tv
-        return best_rv, best_tv, best_err
-
-    # ------------------------------------------------------------------
-    def _pnp_best_dense(
+    def _pnp_best_contour(
         self,
         model_corners4: np.ndarray,
-        img_corners4: np.ndarray,
+        mask_bool: np.ndarray,
         K: np.ndarray,
         dist: np.ndarray,
         prev_rvec: np.ndarray | None = None,
         prev_tvec: np.ndarray | None = None,
-        prev_shift: int | None = None,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, float, int | None]:
-        """
-        Many-point PnP on uniformly sampled mask/model rectangle perimeters.
-        Solves directly on all sampled correspondences (32 by default).
-        """
-        n = self._pnp_n
-        img_n = _sample_quad_perimeter(img_corners4.astype(np.float64), n)
+        prev_phase: int | None = None,
+        prev_reverse: bool | None = None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, float, int | None, bool]:
+        """Dense contour correspondence PnP (phase + direction search)."""
+        n = int(self._pnp_n)
+        mask_u8 = (mask_bool.astype(np.uint8) * 255)
+        img_n = _sample_mask_contour(mask_u8, n)
+        if img_n is None:
+            return None, None, np.inf, None, False
         model_n0 = _sample_quad_perimeter(model_corners4.astype(np.float64), n)
-        step = n // 4
-        best_rv, best_tv, best_err, best_shift = None, None, np.inf, None
+
+        step = max(1, n // 8)
+        candidates: list[tuple[int, bool]]
+        if prev_phase is not None and prev_reverse is not None:
+            phases = [
+                int(prev_phase) % n,
+                (int(prev_phase) - step) % n,
+                (int(prev_phase) + step) % n,
+                (int(prev_phase) - 2 * step) % n,
+                (int(prev_phase) + 2 * step) % n,
+            ]
+            candidates = [(p, bool(prev_reverse)) for p in phases]
+            candidates += [(int(prev_phase) % n, not bool(prev_reverse))]
+        else:
+            candidates = []
+            for rev in (False, True):
+                for phase in range(0, n, step):
+                    candidates.append((int(phase), rev))
+
+        best_rv, best_tv, best_err = None, None, np.inf
+        best_phase, best_reverse = None, False
         best_score = np.inf
-        for shift in range(4):
-            model_n = np.roll(model_n0, shift * step, axis=0)
-            ok, rv, tv = cv2.solvePnP(
-                model_n,
-                img_n,
-                K,
-                dist,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-            )
-            if not ok:
-                ok_epnp, rv_epnp, tv_epnp = cv2.solvePnP(
+        for phase, rev in candidates:
+            model_seq = model_n0[::-1] if rev else model_n0
+            model_n = np.roll(model_seq, int(phase), axis=0)
+            ok = False
+            if prev_rvec is not None and prev_tvec is not None:
+                ok, rv, tv = cv2.solvePnP(
                     model_n,
                     img_n,
                     K,
                     dist,
-                    flags=cv2.SOLVEPNP_EPNP,
+                    prev_rvec.astype(np.float64),
+                    prev_tvec.astype(np.float64),
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+            else:
+                ok, rv, tv = cv2.solvePnP(
+                    model_n,
+                    img_n,
+                    K,
+                    dist,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+            if not ok:
+                ok_epnp, rv_epnp, tv_epnp = cv2.solvePnP(
+                    model_n, img_n, K, dist, flags=cv2.SOLVEPNP_EPNP
                 )
                 if not ok_epnp:
                     continue
@@ -722,22 +725,25 @@ class MeshPoseEstimator:
                 )
                 if not ok_refine:
                     rv, tv = rv_epnp, tv_epnp
+
             proj, _ = cv2.projectPoints(model_n, rv, tv, K, dist)
-            err = float(
-                np.mean(np.linalg.norm(proj.reshape(-1, 2) - img_n, axis=1))
-            )
+            err = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - img_n, axis=1)))
             score = err
             if prev_rvec is not None and prev_tvec is not None:
                 d_rot = _rotation_delta_deg(rv, prev_rvec)
                 z_ref = max(abs(float(prev_tvec[2, 0])), 1e-6)
                 d_t = float(np.linalg.norm(tv.reshape(3) - prev_tvec.reshape(3)) / z_ref)
                 score += PNP_ROT_SMOOTH_W * d_rot + PNP_TRANS_SMOOTH_W * d_t
-            if prev_shift is not None and shift != int(prev_shift):
+            if prev_phase is not None:
+                dphase = min(abs(int(phase) - int(prev_phase)), n - abs(int(phase) - int(prev_phase)))
+                score += 0.01 * float(dphase)
+            if prev_reverse is not None and bool(rev) != bool(prev_reverse):
                 score += PNP_SHIFT_PENALTY
             if score < best_score:
                 best_score = score
-                best_err, best_rv, best_tv, best_shift = err, rv, tv, shift
-        return best_rv, best_tv, best_err, best_shift
+                best_err, best_rv, best_tv = err, rv, tv
+                best_phase, best_reverse = int(phase), bool(rev)
+        return best_rv, best_tv, best_err, best_phase, best_reverse
 
     # ------------------------------------------------------------------
     def estimate_pose(
@@ -749,14 +755,7 @@ class MeshPoseEstimator:
         kalman_process_var: float = KALMAN_PROCESS_VAR,
         kalman_meas_var: float = KALMAN_MEAS_VAR,
     ) -> dict:
-        """
-        Estimate 6DoF pose from a binary mask.  Updates and returns the
-        per-object state dict (keys: 'rvec', 'tvec', optional 'reg_sign').
-
-        PCA eigenvectors are sign-ambiguous; the first successful solve tests
-        all eight ``(±1,±1,±1)`` axis flips on model/mesh, picks the pose with
-        best mask–mesh projection IoU, then fixes ``reg_sign`` for later frames.
-        """
+        """Estimate 6DoF pose from binary mask using contour-only dense PnP."""
         if state is None:
             state = {}
         if not np.any(mask_bool):
@@ -766,14 +765,15 @@ class MeshPoseEstimator:
         ys, xs = np.where(clean)
         if len(xs) < 20:
             return state
-
-        p32 = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
-        rect = cv2.minAreaRect(p32.reshape(-1, 1, 2))
-        img_corners = _order_corners_clockwise(cv2.boxPoints(rect).astype(np.float64))
+        prev_rv = state.get("rvec_raw")
+        prev_tv = state.get("tvec_raw")
+        if prev_rv is None:
+            prev_rv = state.get("rvec")
+        if prev_tv is None:
+            prev_tv = state.get("tvec")
 
         if "reg_sign" not in state:
-            best_key: tuple[float, float] = (-1.0, np.inf)  # (iou, repro_err) maximize iou then min err
-            best_rv, best_tv, best_s, best_shift = None, None, None, None
+            best = (np.inf, None, None, None, None, None)  # err, rv, tv, phase, reverse, sign
             for bits in range(8):
                 s = np.array(
                     [
@@ -783,50 +783,41 @@ class MeshPoseEstimator:
                     ],
                     dtype=np.float64,
                 )
-                model_s = self.model_pts * s
-                verts_s = self.mesh_vertices * s
-                rv, tv, err, shift = self._pnp_best_dense(model_s, img_corners, K, dist)
-                if rv is None:
-                    continue
-                iou = _mesh_projection_iou(
-                    mask_bool, verts_s, self.mesh_faces, rv, tv, K, dist
+                rv_i, tv_i, err_i, ph_i, rev_i = self._pnp_best_contour(
+                    self.model_pts * s,
+                    clean,
+                    K,
+                    dist,
+                    prev_rvec=prev_rv,
+                    prev_tvec=prev_tv,
+                    prev_phase=state.get("contour_phase"),
+                    prev_reverse=state.get("contour_reverse"),
                 )
-                key = (iou, err)
-                if key[0] > best_key[0] or (
-                    key[0] == best_key[0] and key[1] < best_key[1]
-                ):
-                    best_key = (key[0], key[1])
-                    best_rv, best_tv, best_s = rv, tv, s.copy()
-                    best_shift = shift
-                if iou >= 0.75:
-                    break
-            if best_rv is None or best_s is None:
+                if rv_i is None or tv_i is None:
+                    continue
+                if float(err_i) < float(best[0]):
+                    best = (float(err_i), rv_i, tv_i, ph_i, rev_i, s)
+            if best[1] is None or best[2] is None or best[5] is None:
                 return state
-            state["reg_sign"] = best_s
-            rv, tv = best_rv, best_tv
-            state["pnp_shift"] = 0 if best_shift is None else int(best_shift)
+            _err, rv, tv, phase, reverse, s_use = best[0], best[1], best[2], best[3], best[4], best[5]
+            state["reg_sign"] = np.asarray(s_use, dtype=np.float64)
         else:
             s = _reg_sign_from_state(state)
-            model_s = self.model_pts * s
-            prev_rv = state.get("rvec_raw")
-            prev_tv = state.get("tvec_raw")
-            if prev_rv is None:
-                prev_rv = state.get("rvec")
-            if prev_tv is None:
-                prev_tv = state.get("tvec")
-            rv, tv, _, shift = self._pnp_best_dense(
-                model_s,
-                img_corners,
+            rv, tv, _err, phase, reverse = self._pnp_best_contour(
+                self.model_pts * s,
+                clean,
                 K,
                 dist,
                 prev_rvec=prev_rv,
                 prev_tvec=prev_tv,
-                prev_shift=state.get("pnp_shift"),
+                prev_phase=state.get("contour_phase"),
+                prev_reverse=state.get("contour_reverse"),
             )
-            if rv is None:
-                return state
-            if shift is not None:
-                state["pnp_shift"] = int(shift)
+        if rv is None or tv is None:
+            return state
+        if phase is not None:
+            state["contour_phase"] = int(phase)
+        state["contour_reverse"] = bool(reverse)
 
         state["rvec_raw"] = rv.copy()
         state["tvec_raw"] = tv.copy()
@@ -1128,10 +1119,12 @@ def _draw_registration_debug(
     sam_color[:, :, 0] = sam_mask_u8
     cv2.addWeighted(sam_color, 0.30, canvas, 1.0, 0.0, dst=canvas)
 
-    # 2D min-area rectangle around the full projected mesh (mesh footprint in image).
-    rect_mesh = cv2.minAreaRect(pts2d.astype(np.float32))
-    box_mesh = cv2.boxPoints(rect_mesh).astype(np.int32)
-    cv2.polylines(canvas, [box_mesh], True, (0, 255, 255), 2, lineType=cv2.LINE_AA)  # yellow = mesh 2D bbox
+    # Axis-aligned bounding box around projected mesh footprint.
+    x_min = int(np.floor(np.min(pts2d[:, 0])))
+    x_max = int(np.ceil(np.max(pts2d[:, 0])))
+    y_min = int(np.floor(np.min(pts2d[:, 1])))
+    y_max = int(np.ceil(np.max(pts2d[:, 1])))
+    cv2.rectangle(canvas, (x_min, y_min), (x_max, y_max), (0, 255, 255), 2, lineType=cv2.LINE_AA)
 
     # Model midplane quad used by PnP (not the same as full mesh silhouette).
     proj, _ = cv2.projectPoints(est.model_pts * s, rvec, tvec, K, dist)
@@ -1203,15 +1196,26 @@ class LiveFrameProvider:
     model saw.
     """
 
-    def __init__(self, cap: cv2.VideoCapture, image_size: int, rotate_180: bool):
+    def __init__(
+        self,
+        cap: cv2.VideoCapture,
+        image_size: int,
+        rotate_180: bool,
+        sequential_mode: bool = False,
+        max_frames: int | None = None,
+    ):
         self.cap = cap
         self.image_size = image_size
         self.rotate_180 = rotate_180
+        self.sequential_mode = bool(sequential_mode)
+        self.max_frames = None if max_frames is None else int(max_frames)
         # Rolling cache: model_idx -> (tensor, raw). Bounded to last 32 frames.
         self._cache: dict[int, tuple[torch.Tensor, np.ndarray]] = {}
         self._latest_tensor: torch.Tensor | None = None
         self._latest_raw: np.ndarray | None = None
         self._lock = threading.Lock()
+        self._seq_next_idx = 0
+        self._eof = False
 
     def _encode(self, frame: np.ndarray) -> tuple[torch.Tensor, np.ndarray]:
         frame = preprocess(frame, self.rotate_180)
@@ -1222,7 +1226,24 @@ class LiveFrameProvider:
         return (t - _IMG_MEAN) / _IMG_STD, frame
 
     def capture_next(self) -> bool:
-        # Drain any buffered camera frames so we always get the newest one.
+        if self.sequential_mode:
+            if self.max_frames is not None and self._seq_next_idx >= self.max_frames:
+                self._eof = True
+                return False
+            ok, frame = self.cap.read()
+            if not ok:
+                self._eof = True
+                return False
+            t, raw = self._encode(frame)
+            with self._lock:
+                idx = self._seq_next_idx
+                self._seq_next_idx += 1
+                self._latest_tensor = t
+                self._latest_raw = raw
+                self._cache[idx] = (t, raw)
+            return True
+
+        # Drain buffered camera frames so we always get the newest one.
         frame = None
         for _ in range(4):
             ok, f = self.cap.read()
@@ -1237,9 +1258,26 @@ class LiveFrameProvider:
         return True
 
     def __len__(self):
+        if self.sequential_mode and self.max_frames is not None:
+            return max(1, int(self.max_frames))
         return 1_000_000  # always tell SAM2 there are more frames
 
     def __getitem__(self, idx: int) -> torch.Tensor:
+        if self.sequential_mode:
+            while True:
+                with self._lock:
+                    entry = self._cache.get(int(idx))
+                    if entry is not None:
+                        return entry[0]
+                    if self._eof:
+                        if self._latest_tensor is not None:
+                            return self._latest_tensor
+                        raise IndexError("No frames available in sequential source.")
+                if not self.capture_next():
+                    time.sleep(0.001)
+                else:
+                    time.sleep(0.0)
+
         # Block until the camera has produced at least one frame.
         while True:
             with self._lock:
@@ -1281,13 +1319,44 @@ def run(args) -> None:
     # mesh_estimators = _load_mesh_estimators()
     mesh_estimators: dict[int, MeshPoseEstimator] = {}
 
-    cap = cv2.VideoCapture(args.camera)
+    source = (args.camera or "").strip()
+    generated_video_path: Path | None = None
+    use_synthetic_image = (source == "") or source.lower().endswith(
+        (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+    )
+    if use_synthetic_image:
+        image_path = Path(source) if source else Path(args.synthetic_image)
+        if not image_path.is_absolute():
+            image_path = (Path(__file__).parent / image_path).resolve()
+        generated_video_path = (
+            Path(__file__).parent / args.synthetic_video_name
+        ).resolve()
+        _build_repeated_video_from_image(
+            image_path=image_path,
+            out_path=generated_video_path,
+            num_frames=args.synthetic_frames,
+            fps=args.synthetic_fps,
+        )
+        source_to_open = str(generated_video_path)
+        print(
+            f"Using synthetic video from image: {image_path.name} -> "
+            f"{generated_video_path.name} ({args.synthetic_frames} frames)"
+        )
+    else:
+        source_to_open = source
+
+    cap = cv2.VideoCapture(source_to_open)
     if not cap.isOpened():
-        print(f"Could not open camera {args.camera}")
+        print(f"Could not open input source: {source_to_open}")
         return
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize camera-side frame queue
-    rotate_180 = detect_orbbec_camera(args.camera)
-    print(f"Camera {args.camera}: {'Orbbec detected, rotating 180°' if rotate_180 else 'non-Orbbec, no rotation'}")
+    is_camera_index = source_to_open.isdigit()
+    if is_camera_index:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize camera-side frame queue
+    rotate_180 = detect_orbbec_camera(int(source_to_open)) if is_camera_index else False
+    if is_camera_index:
+        print(f"Camera {source_to_open}: {'Orbbec detected, rotating 180°' if rotate_180 else 'non-Orbbec, no rotation'}")
+    else:
+        print(f"Input video '{source_to_open}': video mode, no camera auto-rotation")
 
     # Resolve intrinsics for pose (file > Orbbec SDK > FOV estimate fallback).
     K_cam, dist_cam, intr_src = _resolve_pose_intrinsics(
@@ -1308,7 +1377,14 @@ def run(args) -> None:
         print(f"Distortion coeffs ({len(dflat)}): [{preview}{' ...' if len(dflat) > 5 else ''}]")
 
     image_size = predictor.image_size
-    provider = LiveFrameProvider(cap, image_size, rotate_180)
+    sequential_mode = not is_camera_index
+    provider = LiveFrameProvider(
+        cap,
+        image_size,
+        rotate_180,
+        sequential_mode=sequential_mode,
+        max_frames=(args.synthetic_frames if generated_video_path is not None else None),
+    )
 
     if not provider.capture_next():
         print("No frame from camera.")
@@ -1321,8 +1397,8 @@ def run(args) -> None:
         while not stop_flag.is_set():
             if not provider.capture_next():
                 stop_flag.set()
-
-    threading.Thread(target=_capture_loop, daemon=True).start()
+    if not sequential_mode:
+        threading.Thread(target=_capture_loop, daemon=True).start()
 
     points, seed_frame = pick_points_live(provider, stop_flag)
     if not points:
@@ -1343,7 +1419,7 @@ def run(args) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
     state["images"] = provider
-    state["num_frames"] = 1_000_000
+    state["num_frames"] = len(provider) if sequential_mode else 1_000_000
 
     _seed_ids: list[int] = [int(p[0]) for p in points]
     _seed_masks_np = np.zeros((0, TARGET_SIZE[1], TARGET_SIZE[0]), dtype=np.float32)
@@ -1461,7 +1537,8 @@ def run(args) -> None:
             stream_iter = prop_stream if first_packet is None else itertools.chain([first_packet], prop_stream)
             for fi, obj_ids, masks in stream_iter:
                 frame = provider.get_raw(fi)
-                debug_canvas = frame.copy() if args.align_debug_out else None
+                need_debug_canvas = bool(args.align_debug_out) or bool(args.overlay_frames_dir)
+                debug_canvas = frame.copy() if need_debug_canvas else None
                 if hasattr(obj_ids, "tolist"):
                     ids = [int(x) for x in obj_ids.tolist()]
                 else:
@@ -1547,8 +1624,12 @@ def run(args) -> None:
                 cv2.imshow("EdgeTAM Live", vis)
                 if writer is not None:
                     writer.write(vis)
-                if debug_canvas is not None:
+                if debug_canvas is not None and args.align_debug_out:
                     cv2.imwrite(args.align_debug_out, debug_canvas)
+                if args.overlay_frames_dir and debug_canvas is not None:
+                    out_dir = Path(args.overlay_frames_dir)
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(out_dir / f"frame_{int(fi):06d}.png"), debug_canvas)
                 t_s = float(time.perf_counter())
                 for oid in sorted(pose_states):
                     st = pose_states.get(oid, {})
@@ -1568,7 +1649,7 @@ def run(args) -> None:
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
-                if stop_flag.is_set():
+                if stop_flag.is_set() and not sequential_mode:
                     break
                 fps_frames += 1
                 now = time.perf_counter()
@@ -1588,8 +1669,15 @@ def run(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real-time EdgeTAM tracking on Orbbec RGB stream.")
-    parser.add_argument("--camera", type=int, default=0,
-                        help="Camera index (default 0)")
+    parser.add_argument(
+        "--camera",
+        type=str,
+        default="",
+        help=(
+            "Camera index (e.g. 0) or input path. "
+            "If omitted or set to an image path, a synthetic 100-frame video is built."
+        ),
+    )
     parser.add_argument("--device", default="auto",
                         choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--alpha", type=float, default=0.45,
@@ -1640,6 +1728,33 @@ def main() -> None:
         "--align-debug-out",
         default="",
         help="Optional path to save registration-debug image (SAM mask vs projected GLB) each frame.",
+    )
+    parser.add_argument(
+        "--synthetic-image",
+        default=str(Path(__file__).parent / "testing.jpg"),
+        help="Image path used to build synthetic repeated-frame video when --camera is omitted/image.",
+    )
+    parser.add_argument(
+        "--synthetic-frames",
+        type=int,
+        default=100,
+        help="Number of frames in synthetic video generated from --synthetic-image.",
+    )
+    parser.add_argument(
+        "--synthetic-fps",
+        type=float,
+        default=30.0,
+        help="FPS for synthetic video generated from --synthetic-image.",
+    )
+    parser.add_argument(
+        "--synthetic-video-name",
+        default="testing_100frames.mp4",
+        help="Filename for generated synthetic video in EdgeTAMLive directory.",
+    )
+    parser.add_argument(
+        "--overlay-frames-dir",
+        default=str(Path(__file__).parent / "mesh_overlay_frames"),
+        help="Directory to export per-frame mesh-overlay debug images.",
     )
     args = parser.parse_args()
     run(args)
