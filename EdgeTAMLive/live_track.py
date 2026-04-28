@@ -4,15 +4,16 @@ Real-time surgical tool segmentation and 6-DoF pose with EdgeTAM and SAM3D.
 
 Pipeline
 --------
-1. Frames are captured (camera index, video path, or synthetic still → MP4),
+1. Frames are captured from a live camera index,
    resized to ``TARGET_SIZE``, and normalized for the EdgeTAM video predictor.
 2. The user places seed clicks (monotonic IDs; **ID1 is always scissors**).
    EdgeTAM propagates instance masks through the stream.
-3. SAM3D (fal.ai) turns each seed mask into a mesh GLB. Vertices are rescaled to
+3. ID1 (scissors) loads a fixed local mesh from ``scissors.glb``.
+   Other IDs use SAM3D (fal.ai) from their seed masks. Vertices are rescaled to
    metres using measured length for ID1 (11.75 cm) or ``CLASS_EXTENTS_M`` for
    other classes so OpenCV PnP ``tvec`` is in real-world metres.
 4. :class:`MeshPoseEstimator` aligns a PCA-derived model contour to each mask
-   contour (phase/reversal search, axis sign bootstrap, optional Kalman filter).
+   contour (phase/reversal search, axis sign bootstrap, Kalman smoothing).
 
 Outputs
 -------
@@ -21,12 +22,12 @@ Live window with mask overlay, pose axes, and COM trails; optional MP4;
 
 Environment
 -----------
-``FAL_KEY`` must be set for SAM3D mesh bootstrap. Optional: ``pyorbbecsdk`` for
-factory colour intrinsics on Orbbec devices.
+``FAL_KEY`` must be set only when bootstrapping non-ID1 objects via SAM3D.
+Optional: ``pyorbbecsdk`` for factory colour intrinsics on Orbbec devices.
 
 Usage::
 
-    .venv/bin/python live_track.py                        # camera 0
+    .venv/bin/python live_track.py               # camera 0
     .venv/bin/python live_track.py --camera 1
     .venv/bin/python live_track.py --no-half
     .venv/bin/python live_track.py --output out.mp4
@@ -71,6 +72,7 @@ TARGET_SIZE = (640, 360)
 EDGETAM_REPO = Path(__file__).parent / "EdgeTAM"
 CHECKPOINT = EDGETAM_REPO / "checkpoints" / "edgetam.pt"
 MODEL_CFG = "configs/edgetam.yaml"
+SCISSORS_GLB = Path(__file__).parent / "scissors.glb"
 
 # ImageNet normalization (matches EdgeTAM / SAM2 training).
 _IMG_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
@@ -154,28 +156,6 @@ def detect_orbbec_camera(camera_id: int) -> bool:
             return "orbbec" in m.group(2).lower()
     return False
 
-
-def _build_repeated_video_from_image(
-    image_path: Path, out_path: Path, num_frames: int = 100, fps: float = 30.0,
-) -> Path:
-    """Encode ``num_frames`` copies of one resized frame as a synthetic MP4."""
-    img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"Could not read image: {image_path}")
-    frame = cv2.resize(img, TARGET_SIZE, interpolation=cv2.INTER_AREA)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
-        float(fps), (frame.shape[1], frame.shape[0]),
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not open writer for: {out_path}")
-    try:
-        for _ in range(max(1, int(num_frames))):
-            writer.write(frame)
-    finally:
-        writer.release()
-    return out_path
 
 # ---------------------------------------------------------------------------
 # Point-picking UI
@@ -508,6 +488,76 @@ def _rotation_delta_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))))
 
 
+def _R_to_quat_wxyz(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix → unit quaternion (w, x, y, z)."""
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    t = float(np.trace(R))
+    if t > 0.0:
+        s = 0.5 / np.sqrt(t + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    n = float(np.linalg.norm(q))
+    return q / (n + 1e-12)
+
+
+def _quat_wxyz_to_R(q: np.ndarray) -> np.ndarray:
+    """Unit quaternion (w, x, y, z) → rotation matrix."""
+    q = np.asarray(q, dtype=np.float64).reshape(4)
+    q = q / (float(np.linalg.norm(q)) + 1e-12)
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _unwrap_rvec_quaternion_hemisphere(state: dict, rvec: np.ndarray) -> np.ndarray:
+    """
+    Remove π quaternion flips between frames (q ≡ −q) after scalar Kalman on rvec.
+
+    Per-axis Kalman on Rodrigues components is not SO(3)-consistent; consecutive
+    estimates can jump quaternion hemispheres and make projected axes appear to spin.
+    """
+    R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+    q = _R_to_quat_wxyz(R)
+    prev = state.get("_pose_quat_wxyz")
+    if prev is not None and float(np.dot(q, prev)) < 0.0:
+        q = -q
+    q = q / (float(np.linalg.norm(q)) + 1e-12)
+    state["_pose_quat_wxyz"] = q
+    R2 = _quat_wxyz_to_R(q)
+    out, _ = cv2.Rodrigues(R2)
+    return np.asarray(out, dtype=np.float64).reshape(3, 1)
+
+
 class KalmanScalar:
     """Scalar Kalman filter (constant velocity implicit in random-walk process noise)."""
 
@@ -552,7 +602,8 @@ class MeshPoseEstimator:
       with phase/reversal search and optional previous-pose regularization.
     - On first solve, search all eight axis sign flips and keep the best score
       (reprojection + scissors upright prior for ``obj_id == 1``).
-    - Apply per-component Kalman smoothing to the winning ``rvec``/``tvec``.
+    - Apply per-component Kalman smoothing to the winning ``rvec``/``tvec`` (always on),
+      then quaternion hemisphere unwrapping so axes do not flip-spin frame-to-frame.
     """
 
     def __init__(self, mesh, obj_id: int = 0, object_class: str = "tool"):
@@ -734,8 +785,6 @@ class MeshPoseEstimator:
     # ------------------------------------------------------------------
     def estimate_pose(
         self, mask_bool, K, dist, state,
-        kalman_process_var=KALMAN_PROCESS_VAR,
-        kalman_meas_var=KALMAN_MEAS_VAR,
     ) -> dict:
         """
         Update ``state`` with ``rvec``, ``tvec``, contour phase, and registration sign.
@@ -798,13 +847,14 @@ class MeshPoseEstimator:
         state["rvec_raw"] = rv.copy()
         state["tvec_raw"] = tv.copy()
 
-        rv, tv = _apply_kalman_pose_filter(state, rv, tv, kalman_process_var, kalman_meas_var)
+        rv, tv = _apply_kalman_pose_filter(state, rv, tv, KALMAN_PROCESS_VAR, KALMAN_MEAS_VAR)
+        rv = _unwrap_rvec_quaternion_hemisphere(state, rv)
         state["rvec"] = rv
         state["tvec"] = tv
         return state
 
 # ---------------------------------------------------------------------------
-# SAM3D (fal.ai): mask → GLB mesh → MeshPoseEstimator per object id
+# Mesh bootstrap: ID1 from local scissors.glb; others via SAM3D
 # ---------------------------------------------------------------------------
 
 def _bootstrap_sam3d_estimators(
@@ -816,35 +866,78 @@ def _bootstrap_sam3d_estimators(
     object_classes: dict[int, str],
 ) -> tuple[dict[int, MeshPoseEstimator], dict[int, dict]]:
     """
-    Upload seed image and per-object masks, run SAM3D, download GLBs, build estimators.
+    Build per-object ``MeshPoseEstimator`` instances:
 
-    Requires ``FAL_KEY``, ``fal_client``, and ``trimesh``. Writes ``sam3d_bootstrap.json``
-    under ``output_dir`` when any object succeeds.
+    - ID1 always uses local ``SCISSORS_GLB``.
+    - Other IDs: upload seed image + mask to SAM3D and download GLBs.
+
+    Requires ``trimesh`` always; requires ``FAL_KEY`` and ``fal_client`` only when
+    at least one non-ID1 object is bootstrapped from SAM3D.
     """
     if trimesh is None:
         print("`trimesh` not installed."); return {}, {}
-    if not os.environ.get("FAL_KEY"):
-        print("FAL_KEY not set."); return {}, {}
-    try:
-        import fal_client  # type: ignore
-    except Exception as e:
-        print(f"`fal-client` import failed: {e}"); return {}, {}
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    seed_path = output_dir / "seed_frame.png"
-    cv2.imwrite(str(seed_path), seed_frame_bgr)
-    image_url = fal_client.upload_file(str(seed_path))
-    print(f"SAM3D bootstrap: uploaded seed frame.")
-
     estimators: dict[int, MeshPoseEstimator] = {}
     payload:    dict[int, dict]               = {}
     fh, fw = seed_frame_bgr.shape[:2]
+    have_non_id1 = False
+
+    # ID1 (scissors) is always loaded from a fixed local GLB.
+    if 1 in {int(v) for v in ids}:
+        if not SCISSORS_GLB.exists():
+            print(f"[ID1] Local scissors GLB not found: {SCISSORS_GLB}")
+        else:
+            try:
+                mesh = trimesh.load(str(SCISSORS_GLB), force="mesh")
+                estimators[1] = MeshPoseEstimator(mesh, obj_id=1, object_class="scissors")
+                payload[1] = {"source": "local_glb", "glb_path": str(SCISSORS_GLB)}
+                print(f"[ID1] Loaded local scissors GLB: {SCISSORS_GLB.name}")
+            except Exception as e:
+                print(f"[ID1] Failed to load local scissors GLB: {e}")
 
     for i in range(min(len(ids), masks_np.shape[0])):
         oid  = int(ids[i])
+        if oid == 1:
+            continue
         binm = _mask_to_2d_bool(masks_np[i], fh, fw).astype(np.uint8)
         if not np.any(binm):
             print(f"[ID{oid}] Empty mask; skipping SAM3D."); continue
+        have_non_id1 = True
+
+    if not have_non_id1:
+        if payload:
+            (output_dir / "sam3d_bootstrap.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8")
+        return estimators, payload
+
+    if not os.environ.get("FAL_KEY"):
+        print("FAL_KEY not set for non-ID1 SAM3D bootstrap.")
+        if payload:
+            (output_dir / "sam3d_bootstrap.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8")
+        return estimators, payload
+    try:
+        import fal_client  # type: ignore
+    except Exception as e:
+        print(f"`fal-client` import failed: {e}")
+        if payload:
+            (output_dir / "sam3d_bootstrap.json").write_text(
+                json.dumps(payload, indent=2), encoding="utf-8")
+        return estimators, payload
+
+    seed_path = output_dir / "seed_frame.png"
+    cv2.imwrite(str(seed_path), seed_frame_bgr)
+    image_url = fal_client.upload_file(str(seed_path))
+    print("SAM3D bootstrap: uploaded seed frame (non-ID1 objects).")
+
+    for i in range(min(len(ids), masks_np.shape[0])):
+        oid  = int(ids[i])
+        if oid == 1:
+            continue
+        binm = _mask_to_2d_bool(masks_np[i], fh, fw).astype(np.uint8)
+        if not np.any(binm):
+            continue
 
         mask_path = output_dir / f"object_{oid}_mask.png"
         cv2.imwrite(str(mask_path), binm * 255)
@@ -1146,33 +1239,14 @@ def run(args) -> None:
     print("Loading EdgeTAM …")
     predictor = _load_predictor(device)
 
-    source = (args.camera or "").strip()
-    use_synthetic = (source == "") or source.lower().endswith(
-        (".jpg", ".jpeg", ".png", ".bmp", ".webp"))
-    generated_video_path: Path | None = None
-
-    if use_synthetic:
-        image_path = Path(source) if source else Path(args.synthetic_image)
-        if not image_path.is_absolute():
-            image_path = (Path(__file__).parent / image_path).resolve()
-        generated_video_path = (Path(__file__).parent / args.synthetic_video_name).resolve()
-        _build_repeated_video_from_image(
-            image_path, generated_video_path,
-            args.synthetic_frames, args.synthetic_fps)
-        source_to_open = str(generated_video_path)
-        print(f"Synthetic video: {image_path.name} → {generated_video_path.name}")
-    else:
-        source_to_open = source
-
-    cap = cv2.VideoCapture(source_to_open)
+    camera_id = int(args.camera)
+    cap = cv2.VideoCapture(camera_id)
     if not cap.isOpened():
-        print(f"Could not open: {source_to_open}"); return
+        print(f"Could not open camera index: {camera_id}"); return
 
-    is_camera_index = source_to_open.isdigit()
-    if is_camera_index:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    rotate_180 = detect_orbbec_camera(int(source_to_open)) if is_camera_index else False
-    sequential_mode = not is_camera_index
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    rotate_180 = detect_orbbec_camera(camera_id)
+    sequential_mode = False
 
     K_cam, dist_cam, intr_src = _resolve_pose_intrinsics(
         cap, TARGET_SIZE[0], TARGET_SIZE[1],
@@ -1192,7 +1266,7 @@ def run(args) -> None:
     provider       = LiveFrameProvider(
         cap, image_size, rotate_180,
         sequential_mode=sequential_mode,
-        max_frames=args.synthetic_frames if generated_video_path else None,
+        max_frames=None,
     )
     if not provider.capture_next():
         print("No frame from camera."); cap.release(); return
@@ -1288,8 +1362,6 @@ def run(args) -> None:
         if np.any(binm):
             pose_states[oid] = est.estimate_pose(
                 binm, K_cam, dist_cam, pose_states.get(oid),
-                kalman_process_var=args.kalman_process_var,
-                kalman_meas_var=args.kalman_meas_var,
             )
 
     fps_t0, fps_frames = time.perf_counter(), 0
@@ -1329,8 +1401,6 @@ def run(args) -> None:
 
                     pose_states[oid] = est.estimate_pose(
                         binm, K_cam, dist_cam, pose_states.get(oid),
-                        kalman_process_var=args.kalman_process_var,
-                        kalman_meas_var=args.kalman_meas_var,
                     )
                     _draw_pose_axes(vis, pose_states[oid], K_cam, dist_cam, est.axis_pts, oid)
                     if debug_canvas is not None:
@@ -1404,14 +1474,12 @@ def main() -> None:
             "ID1 is scissors (11.75 cm metric reference); use --object-classes for other IDs."
         ),
     )
-    parser.add_argument("--camera", type=str, default="")
+    parser.add_argument("--camera", type=int, default=0, help="Live camera index (default: 0)")
     parser.add_argument("--device", default="auto", choices=["auto","cuda","mps","cpu"])
     parser.add_argument("--object-classes", nargs="*", default=[],
                         help="Classes for ID2, ID3 … in order (ID1 is always scissors). "
                              "e.g. --object-classes scalpel bottle bag")
     parser.add_argument("--alpha", type=float, default=0.45)
-    parser.add_argument("--kalman-process-var", type=float, default=KALMAN_PROCESS_VAR)
-    parser.add_argument("--kalman-meas-var",    type=float, default=KALMAN_MEAS_VAR)
     parser.add_argument("--half", action="store_true", default=True)
     parser.add_argument("--no-half", dest="half", action="store_false")
     parser.add_argument("--output", default="")
@@ -1425,10 +1493,6 @@ def main() -> None:
         default="",
         help="Optional directory to export per-frame debug overlays. Disabled by default.",
     )
-    parser.add_argument("--synthetic-image",  default=str(Path(__file__).parent / "testing.jpg"))
-    parser.add_argument("--synthetic-frames", type=int,   default=100)
-    parser.add_argument("--synthetic-fps",    type=float, default=30.0)
-    parser.add_argument("--synthetic-video-name", default="testing_100frames.mp4")
     args = parser.parse_args()
     run(args)
 
