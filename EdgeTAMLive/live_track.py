@@ -1,20 +1,42 @@
 #!/usr/bin/env python3
 """
-Real-time surgical tool tracking with EdgeTAM.
+Real-time surgical tool segmentation and 6-DoF pose with EdgeTAM and SAM3D.
 
-ID1 is always scissors (11.75 cm) — used as the scale calibration object.
-The scissors GLB from SAM3D is normalised to 11.75 cm before PnP so that
-all tvec values come out in real metres.
+Pipeline
+--------
+1. Frames are captured (camera index, video path, or synthetic still → MP4),
+   resized to ``TARGET_SIZE``, and normalized for the EdgeTAM video predictor.
+2. The user places seed clicks (monotonic IDs; **ID1 is always scissors**).
+   EdgeTAM propagates instance masks through the stream.
+3. SAM3D (fal.ai) turns each seed mask into a mesh GLB. Vertices are rescaled to
+   metres using measured length for ID1 (11.75 cm) or ``CLASS_EXTENTS_M`` for
+   other classes so OpenCV PnP ``tvec`` is in real-world metres.
+4. :class:`MeshPoseEstimator` aligns a PCA-derived model contour to each mask
+   contour (phase/reversal search, axis sign bootstrap, optional Kalman filter).
 
-Usage:
+Outputs
+-------
+Live window with mask overlay, pose axes, and COM trails; optional MP4;
+``posesN.csv`` in the current working directory (Euler ZYX degrees + translation m).
+
+Environment
+-----------
+``FAL_KEY`` must be set for SAM3D mesh bootstrap. Optional: ``pyorbbecsdk`` for
+factory colour intrinsics on Orbbec devices.
+
+Usage::
+
     .venv/bin/python live_track.py                        # camera 0
     .venv/bin/python live_track.py --camera 1
     .venv/bin/python live_track.py --no-half
     .venv/bin/python live_track.py --output out.mp4
 
-Keybindings:
-    Enter      Confirm seed points and start tracking
-    q / ESC    Quit
+Keybindings (seed window)
+-------------------------
+Enter / Return    Confirm seeds and start tracking
+Backspace         Undo last point
+c                 Clear all points
+q / ESC           Quit without starting
 """
 
 import argparse
@@ -50,8 +72,9 @@ EDGETAM_REPO = Path(__file__).parent / "EdgeTAM"
 CHECKPOINT = EDGETAM_REPO / "checkpoints" / "edgetam.pt"
 MODEL_CFG = "configs/edgetam.yaml"
 
+# ImageNet normalization (matches EdgeTAM / SAM2 training).
 _IMG_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
-_IMG_STD  = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
+_IMG_STD = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
 # ---------------------------------------------------------------------------
 # Calibration: ID1 is always scissors, measured at 11.75 cm.
@@ -72,10 +95,11 @@ CLASS_EXTENTS_M: dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
-# EdgeTAM loader
+# EdgeTAM predictor
 # ---------------------------------------------------------------------------
 
 def _load_predictor(device: str):
+    """Insert local ``EdgeTAM`` repo on ``sys.path`` and build the video predictor."""
     repo = str(EDGETAM_REPO.resolve())
     if repo not in sys.path:
         sys.path.insert(0, repo)
@@ -84,6 +108,7 @@ def _load_predictor(device: str):
 
 
 def _autocast_config(device: str, use_half: bool) -> tuple[str, torch.dtype, bool]:
+    """Return (device_type, dtype, enabled) for ``torch.autocast``."""
     device_type = device.split(":")[0]
     dtype = torch.bfloat16 if device_type == "cuda" else torch.float16
     enabled = use_half and device_type != "cpu"
@@ -91,6 +116,7 @@ def _autocast_config(device: str, use_half: bool) -> tuple[str, torch.dtype, boo
 
 
 def choose_device(arg: str) -> str:
+    """Resolve ``auto`` to cuda, mps, or cpu in that order of preference."""
     if arg != "auto":
         return arg
     if torch.cuda.is_available():
@@ -104,12 +130,14 @@ def choose_device(arg: str) -> str:
 # ---------------------------------------------------------------------------
 
 def preprocess(frame: np.ndarray, rotate_180: bool) -> np.ndarray:
+    """Optional 180° rotation (Orbbec colour) then resize to ``TARGET_SIZE``."""
     if rotate_180:
         frame = cv2.rotate(frame, cv2.ROTATE_180)
     return cv2.resize(frame, TARGET_SIZE, interpolation=cv2.INTER_AREA)
 
 
 def detect_orbbec_camera(camera_id: int) -> bool:
+    """Return True if ffmpeg's AVFoundation listing names this index as Orbbec."""
     try:
         proc = subprocess.run(
             ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
@@ -130,6 +158,7 @@ def detect_orbbec_camera(camera_id: int) -> bool:
 def _build_repeated_video_from_image(
     image_path: Path, out_path: Path, num_frames: int = 100, fps: float = 30.0,
 ) -> Path:
+    """Encode ``num_frames`` copies of one resized frame as a synthetic MP4."""
     img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
@@ -155,6 +184,15 @@ def _build_repeated_video_from_image(
 def pick_points_live(
     provider: "LiveFrameProvider", stop_flag: threading.Event
 ) -> tuple[list[tuple[int, float, float]], np.ndarray | None]:
+    """
+    Interactive OpenCV window to collect positive seed points.
+
+    Each click appends ``(object_id, x, y)`` with IDs ``1..N`` in order.
+    The first click freezes the background frame used as the EdgeTAM seed.
+
+    Returns:
+        Empty list and None if cancelled; else ``(points, seed_frame_bgr)``.
+    """
     win = "Select EdgeTAM points  (ID1 = scissors)"
     points: list[tuple[int, float, float]] = []
     frozen_frame: np.ndarray | None = None
@@ -191,13 +229,20 @@ def pick_points_live(
     cancelled = False
     while True:
         if stop_flag.is_set():
-            cancelled = True; break
+            cancelled = True
+            break
         cv2.imshow(win, draw())
         k = cv2.waitKey(20) & 0xFF
-        if k in (13, 10) and points: break
-        elif k in (8, 127) and points: points.pop()
-        elif k == ord("c"): points.clear(); frozen_frame = None
-        elif k in (ord("q"), 27): cancelled = True; break
+        if k in (13, 10) and points:
+            break
+        elif k in (8, 127) and points:
+            points.pop()
+        elif k == ord("c"):
+            points.clear()
+            frozen_frame = None
+        elif k in (ord("q"), 27):
+            cancelled = True
+            break
     cv2.destroyWindow(win)
     if cancelled:
         return [], None
@@ -205,16 +250,18 @@ def pick_points_live(
     return points, (None if seed_frame is None else seed_frame.copy())
 
 # ---------------------------------------------------------------------------
-# Colour helpers
+# Visualization (mask tint, stable colours per object id)
 # ---------------------------------------------------------------------------
 
 def point_color(obj_id: int) -> tuple[int, int, int]:
+    """Deterministic saturated BGR colour for ``obj_id`` (for trails / overlays)."""
     hue = (obj_id * 47 + 20) % 180
     bgr = cv2.cvtColor(np.uint8([[[hue, 220, 255]]]), cv2.COLOR_HSV2BGR)[0][0]
     return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
 
 def _mask_to_2d_bool(m: np.ndarray, fh: int, fw: int) -> np.ndarray:
+    """Collapse arbitrary mask rank to ``(fh, fw)`` boolean; nearest resize if needed."""
     x = np.squeeze(np.asarray(m, dtype=np.float32))
     while x.ndim > 2:
         x = x[0]
@@ -226,6 +273,7 @@ def _mask_to_2d_bool(m: np.ndarray, fh: int, fw: int) -> np.ndarray:
 
 
 def overlay_masks(frame, obj_ids, masks, alpha=0.45):
+    """Alpha-blend each instance mask onto ``frame`` using :func:`point_color`."""
     vis = frame.copy().astype(np.float32)
     fh, fw = frame.shape[:2]
     masks_np = masks.detach().cpu().numpy()
@@ -238,12 +286,13 @@ def overlay_masks(frame, obj_ids, masks, alpha=0.45):
     return vis.astype(np.uint8)
 
 # ---------------------------------------------------------------------------
-# Intrinsics
+# Camera intrinsics (file, Orbbec SDK, or generic FOV fallback)
 # ---------------------------------------------------------------------------
 
 def _estimate_intrinsics_from_cap(
     cap: cv2.VideoCapture, target_w: int, target_h: int
 ) -> np.ndarray:
+    """Approximate K from cap native resolution and fixed 79°×62° FOV (last resort)."""
     native_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     native_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     if native_w <= 0 or native_h <= 0:
@@ -259,6 +308,7 @@ def _estimate_intrinsics_from_cap(
 
 
 def _rescale_intrinsics(K, src_w, src_h, dst_w, dst_h):
+    """Scale fx, fy, cx, cy when the calibration resolution differs from the target."""
     sx = float(dst_w) / max(float(src_w), 1e-9)
     sy = float(dst_h) / max(float(src_h), 1e-9)
     K2 = np.asarray(K, dtype=np.float64).copy()
@@ -267,6 +317,7 @@ def _rescale_intrinsics(K, src_w, src_h, dst_w, dst_h):
 
 
 def _load_intrinsics_from_file(path, target_w, target_h):
+    """Load 3×3 K (and optional distortion) from ``.npz``; rescale if width/height present."""
     try:
         data = np.load(path, allow_pickle=False)
     except Exception as e:
@@ -294,6 +345,7 @@ def _load_intrinsics_from_file(path, target_w, target_h):
 
 
 def _try_read_orbbec_intrinsics(target_w, target_h):
+    """Read colour intrinsics from pyorbbecsdk default profile, scaled to target size."""
     try:
         from pyorbbecsdk import Config, OBSensorType, Pipeline  # type: ignore
     except Exception:
@@ -323,11 +375,14 @@ def _try_read_orbbec_intrinsics(target_w, target_h):
         return None
     finally:
         if pipeline:
-            try: pipeline.stop()
-            except: pass
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
 
 
 def _resolve_pose_intrinsics(cap, target_w, target_h, intrinsics_file, try_orbbec):
+    """Prefer ``.npz`` file, then Orbbec SDK, else FOV-based estimate; returns (K, dist, tag)."""
     if intrinsics_file:
         loaded = _load_intrinsics_from_file(intrinsics_file, target_w, target_h)
         if loaded is not None:
@@ -341,7 +396,7 @@ def _resolve_pose_intrinsics(cap, target_w, target_h, intrinsics_file, try_orbbe
     return K, np.zeros((4, 1), dtype=np.float64), "fov_estimate"
 
 # ---------------------------------------------------------------------------
-# Mesh normalisation — the only addition to the original algorithm
+# Mesh scale: SAM3D meshes are unitless; rescale to metres before PnP
 # ---------------------------------------------------------------------------
 
 def _normalize_mesh_to_known_length(
@@ -375,25 +430,30 @@ def _normalize_mesh_to_known_length(
     return verts * scale
 
 # ---------------------------------------------------------------------------
-# PnP helpers  (unchanged from original)
+# Dense contour ↔ model PnP, temporal smoothing, calibration prior
 # ---------------------------------------------------------------------------
 
 def _reg_sign_from_state(state: dict) -> np.ndarray:
+    """Per-axis flips (+1/−1) chosen at bootstrap so mesh axes match the mask."""
     s = state.get("reg_sign")
     if s is None:
         return np.ones(3, dtype=np.float64)
     return np.asarray(s, dtype=np.float64).reshape(3)
 
 
+# Samples per edge when densifying the model polygon for PnP correspondence.
 PNP_PER_EDGE = 8
+# Default 1D Kalman variances for rvec (3) + tvec (3) element-wise filtering.
 KALMAN_PROCESS_VAR = 2e-4
 KALMAN_MEAS_VAR = 4e-3
+# Extra cost terms when choosing contour phase/reversal vs previous frame.
 PNP_ROT_SMOOTH_W = 0.03
 PNP_TRANS_SMOOTH_W = 8.0
 PNP_SHIFT_PENALTY = 0.75
 
 
 def _sample_poly_perimeter(poly: np.ndarray, n: int) -> np.ndarray:
+    """Uniformly sample ``n`` points along closed polygon edge length."""
     D = int(poly.shape[1])
     if poly.shape[0] < 2:
         return np.repeat(poly[:1].astype(np.float64), n, axis=0)
@@ -416,6 +476,7 @@ def _sample_poly_perimeter(poly: np.ndarray, n: int) -> np.ndarray:
 
 
 def _sample_mask_contour(mask_u8: np.ndarray, n: int) -> np.ndarray | None:
+    """Largest external contour of binary mask, uniformly resampled to ``n`` points."""
     cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not cnts:
         return None
@@ -440,6 +501,7 @@ def _sample_mask_contour(mask_u8: np.ndarray, n: int) -> np.ndarray | None:
 
 
 def _rotation_delta_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
+    """Geodesic angle in degrees between two Rodrigues rotation vectors."""
     Ra, _ = cv2.Rodrigues(rvec_a.astype(np.float64))
     Rb, _ = cv2.Rodrigues(rvec_b.astype(np.float64))
     R = Ra @ Rb.T
@@ -447,6 +509,8 @@ def _rotation_delta_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
 
 
 class KalmanScalar:
+    """Scalar Kalman filter (constant velocity implicit in random-walk process noise)."""
+
     def __init__(self, process_var: float, meas_var: float):
         self.q = max(float(process_var), 1e-12)
         self.r = max(float(meas_var), 1e-12)
@@ -456,7 +520,9 @@ class KalmanScalar:
     def filter(self, z: float) -> float:
         z = float(z)
         if self.x is None:
-            self.x = z; self.p = 1.0; return z
+            self.x = z
+            self.p = 1.0
+            return z
         self.p += self.q
         k = self.p / (self.p + self.r)
         self.x = self.x + k * (z - self.x)
@@ -465,6 +531,7 @@ class KalmanScalar:
 
 
 def _apply_kalman_pose_filter(state, rv, tv, process_var, meas_var):
+    """Six independent scalar filters on ``rvec`` and ``tvec`` components; stateful."""
     filters = state.get("kalman_filters")
     if filters is None or len(filters) != 6:
         filters = [KalmanScalar(process_var, meas_var) for _ in range(6)]
@@ -474,17 +541,18 @@ def _apply_kalman_pose_filter(state, rv, tv, process_var, meas_var):
     return out[:3].reshape(3, 1), out[3:].reshape(3, 1)
 
 # ---------------------------------------------------------------------------
-# MeshPoseEstimator  — original algorithm + scale normalisation
+# MeshPoseEstimator: metric mesh + dense PnP + optional scissors prior
 # ---------------------------------------------------------------------------
 
 class MeshPoseEstimator:
     """
-    Original contour-dense PnP estimator, with one addition:
-    mesh vertices are rescaled to physical metres using the known
-    object length before any PnP is run.
+    Build a planar PnP model from a mesh (PCA, convex hull in XY), then each frame:
 
-    For ID1 (scissors) this uses the measured 11.75 cm ground truth,
-    so tvec Z comes out in real metres from the first frame.
+    - Erode the mask, sample the largest contour, and match it to the model polygon
+      with phase/reversal search and optional previous-pose regularization.
+    - On first solve, search all eight axis sign flips and keep the best score
+      (reprojection + scissors upright prior for ``obj_id == 1``).
+    - Apply per-component Kalman smoothing to the winning ``rvec``/``tvec``.
     """
 
     def __init__(self, mesh, obj_id: int = 0, object_class: str = "tool"):
@@ -539,13 +607,62 @@ class MeshPoseEstimator:
             [[0.0,0.0,0.0],[ax,0.0,0.0],[0.0,ay,0.0],[0.0,0.0,az]],
             dtype=np.float64,
         )
+        # Estimate semantic endpoints on principal axis for calibration prior:
+        # handle/rings end has larger cross-sectional radius than tip end.
+        x = aligned[:, 0]
+        yz_r = np.linalg.norm(aligned[:, 1:3], axis=1)
+        x_min, x_max = float(x.min()), float(x.max())
+        band = max(1e-6, 0.20 * (x_max - x_min))
+        low_mask = x <= (x_min + band)
+        high_mask = x >= (x_max - band)
+        r_low = float(np.mean(yz_r[low_mask])) if np.any(low_mask) else 0.0
+        r_high = float(np.mean(yz_r[high_mask])) if np.any(high_mask) else 0.0
+        if r_low >= r_high:
+            self.handle_pt = np.array([x_min, 0.0, 0.0], dtype=np.float64)
+            self.tip_pt = np.array([x_max, 0.0, 0.0], dtype=np.float64)
+        else:
+            self.handle_pt = np.array([x_max, 0.0, 0.0], dtype=np.float64)
+            self.tip_pt = np.array([x_min, 0.0, 0.0], dtype=np.float64)
         self._pnp_n = max(4 * PNP_PER_EDGE, int(self.model_pts.shape[0]) * max(2, PNP_PER_EDGE // 2))
+
+    # ------------------------------------------------------------------
+    def _calibration_orientation_penalty(self, rvec, tvec, K, dist, sign=None) -> float:
+        """
+        Prior for calibration object (ID1 = scissors):
+        - scissors should be upright in the image
+        - tip should point upward
+        - handle/rings should stay below tip
+        """
+        if int(self.obj_id) != 1:
+            return 0.0
+        s = np.ones(3, dtype=np.float64) if sign is None else np.asarray(sign, dtype=np.float64).reshape(3)
+        calib_pts = np.vstack([self.handle_pt, self.tip_pt]).astype(np.float64) * s.reshape(1, 3)
+        proj, _ = cv2.projectPoints(calib_pts, rvec, tvec, K, dist)
+        pts = proj.reshape(-1, 2)
+        handle = pts[0]
+        tip = pts[1]
+        v = tip - handle
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            return 1e6
+        ux, uy = float(v[0] / n), float(v[1] / n)
+        # Prefer vertical orientation (small |ux|) and tip-up (negative uy),
+        # and strongly reject flipped pose where tip is below handle.
+        vertical_pen = abs(ux)
+        tip_up_pen = max(0.0, uy)
+        hard_flip_pen = 100.0 if float(tip[1]) >= float(handle[1]) else 0.0
+        return hard_flip_pen + 4.0 * vertical_pen + 8.0 * tip_up_pen
 
     # ------------------------------------------------------------------
     def _pnp_best_contour(
         self, model_corners4, mask_bool, K, dist,
         prev_rvec=None, prev_tvec=None, prev_phase=None, prev_reverse=None,
     ):
+        """
+        Match uniformly sampled model boundary to mask contour; search phase/reversal.
+
+        Returns ``(rvec, tvec, mean_reproj_err, phase, reverse)`` or Nones if PnP fails.
+        """
         n = int(self._pnp_n)
         img_n = _sample_mask_contour(mask_bool.astype(np.uint8) * 255, n)
         if img_n is None:
@@ -620,6 +737,11 @@ class MeshPoseEstimator:
         kalman_process_var=KALMAN_PROCESS_VAR,
         kalman_meas_var=KALMAN_MEAS_VAR,
     ) -> dict:
+        """
+        Update ``state`` with ``rvec``, ``tvec``, contour phase, and registration sign.
+
+        Returns the same dict reference (possibly unchanged if the mask is empty).
+        """
         if state is None:
             state = {}
         if not np.any(mask_bool):
@@ -648,8 +770,13 @@ class MeshPoseEstimator:
                     prev_phase=state.get("contour_phase"),
                     prev_reverse=state.get("contour_reverse"),
                 )
-                if rv_i is not None and float(err_i) < float(best[0]):
-                    best = (float(err_i), rv_i, tv_i, ph_i, rev_i, s)
+                if rv_i is None:
+                    continue
+                sign_score = float(err_i) + self._calibration_orientation_penalty(
+                    rv_i, tv_i, K, dist, sign=s
+                )
+                if sign_score < float(best[0]):
+                    best = (sign_score, rv_i, tv_i, ph_i, rev_i, s)
             if best[1] is None:
                 return state
             _, rv, tv, phase, reverse, s_use = best
@@ -677,7 +804,7 @@ class MeshPoseEstimator:
         return state
 
 # ---------------------------------------------------------------------------
-# SAM3D bootstrap
+# SAM3D (fal.ai): mask → GLB mesh → MeshPoseEstimator per object id
 # ---------------------------------------------------------------------------
 
 def _bootstrap_sam3d_estimators(
@@ -688,6 +815,12 @@ def _bootstrap_sam3d_estimators(
     fal_model: str,
     object_classes: dict[int, str],
 ) -> tuple[dict[int, MeshPoseEstimator], dict[int, dict]]:
+    """
+    Upload seed image and per-object masks, run SAM3D, download GLBs, build estimators.
+
+    Requires ``FAL_KEY``, ``fal_client``, and ``trimesh``. Writes ``sam3d_bootstrap.json``
+    under ``output_dir`` when any object succeeds.
+    """
     if trimesh is None:
         print("`trimesh` not installed."); return {}, {}
     if not os.environ.get("FAL_KEY"):
@@ -744,10 +877,11 @@ def _bootstrap_sam3d_estimators(
     return estimators, payload
 
 # ---------------------------------------------------------------------------
-# Drawing  (unchanged from original)
+# On-screen pose axes, HUD, and alignment debug (mesh vs mask IoU)
 # ---------------------------------------------------------------------------
 
 def _draw_pose_axes(vis, state, K, dist, axis_pts, obj_id):
+    """Draw capped XYZ arrows in image space from ``axis_pts`` and current pose."""
     max_arrow_px = 40.0
     rvec = state.get("rvec"); tvec = state.get("tvec")
     if rvec is None or tvec is None:
@@ -780,6 +914,7 @@ def _draw_pose_axes(vis, state, K, dist, axis_pts, obj_id):
 
 
 def _draw_pose_hud(vis, pose_states):
+    """Overlay Euler + translation text for each tracked object id."""
     if not pose_states:
         return
     fnt = cv2.FONT_HERSHEY_SIMPLEX
@@ -807,6 +942,7 @@ def _draw_pose_hud(vis, pose_states):
 
 
 def _draw_registration_debug(canvas, mask_bool, state, est, K, dist, obj_id):
+    """Project mesh faces, SAM mask, PnP polygon, contour samples, and IoU for tuning."""
     rvec = state.get("rvec"); tvec = state.get("tvec")
     if rvec is None or tvec is None or not np.any(mask_bool):
         return
@@ -867,10 +1003,21 @@ def _draw_registration_debug(canvas, mask_bool, state, est, K, dist, obj_id):
     cv2.putText(canvas, text, (tx+8,ty+14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
 
 # ---------------------------------------------------------------------------
-# Live frame provider  (unchanged from original)
+# LiveFrameProvider: bridge OpenCV capture to EdgeTAM tensor "video" API
 # ---------------------------------------------------------------------------
 
 class LiveFrameProvider:
+    """
+    Feeds EdgeTAM ``__getitem__(idx)`` with normalized CHW tensors.
+
+    **Live camera:** a daemon thread calls :meth:`capture_next` in a loop (discards
+    buffered frames, keeps latest). ``__getitem__`` returns the cached tensor for any
+    ``idx`` (small LRU cache of raw BGR for ``get_raw``).
+
+    **Sequential file:** ``capture_next`` advances one frame per call; ``__getitem__``
+    blocks until that index exists. ``len()`` reflects ``max_frames`` for synthetic clips.
+    """
+
     def __init__(self, cap, image_size, rotate_180,
                  sequential_mode=False, max_frames=None):
         self.cap            = cap
@@ -886,6 +1033,7 @@ class LiveFrameProvider:
         self._eof = False
 
     def _encode(self, frame):
+        """BGR frame → preprocessed BGR ``TARGET_SIZE`` + normalized square RGB tensor."""
         frame = preprocess(frame, self.rotate_180)
         rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         t     = torch.from_numpy(
@@ -894,15 +1042,21 @@ class LiveFrameProvider:
         return (t - _IMG_MEAN) / _IMG_STD, frame
 
     def capture_next(self) -> bool:
+        """Grab one frame from ``cap``, update latest tensor/raw; False on EOF/failure."""
         if self.sequential_mode:
             if self.max_frames is not None and self._seq_next_idx >= self.max_frames:
-                self._eof = True; return False
+                self._eof = True
+                return False
             ok, frame = self.cap.read()
-            if not ok: self._eof = True; return False
+            if not ok:
+                self._eof = True
+                return False
             t, raw = self._encode(frame)
             with self._lock:
-                idx = self._seq_next_idx; self._seq_next_idx += 1
-                self._latest_tensor = t; self._latest_raw = raw
+                idx = self._seq_next_idx
+                self._seq_next_idx += 1
+                self._latest_tensor = t
+                self._latest_raw = raw
                 self._cache[idx] = (t, raw)
             return True
         frame = None
@@ -912,7 +1066,8 @@ class LiveFrameProvider:
         if frame is None: return False
         t, raw = self._encode(frame)
         with self._lock:
-            self._latest_tensor = t; self._latest_raw = raw
+            self._latest_tensor = t
+            self._latest_raw = raw
         return True
 
     def __len__(self):
@@ -921,6 +1076,7 @@ class LiveFrameProvider:
         return 1_000_000
 
     def __getitem__(self, idx: int) -> torch.Tensor:
+        """Normalized CHW tensor for frame index ``idx`` (blocks until available)."""
         if self.sequential_mode:
             while True:
                 with self._lock:
@@ -941,15 +1097,17 @@ class LiveFrameProvider:
             time.sleep(0.001)
 
     def get_raw(self, idx: int) -> np.ndarray:
+        """BGR uint8 at ``TARGET_SIZE`` for visualization / CSV alignment to frame ``idx``."""
         with self._lock:
             entry = self._cache.get(idx)
             return entry[1] if entry is not None else self._latest_raw
 
 # ---------------------------------------------------------------------------
-# Main loop
+# CLI entry: wiring predictor, SAM3D, propagate loop, CSV / video export
 # ---------------------------------------------------------------------------
 
 def _pose_to_euler_zyx_deg(rvec):
+    """Euler angles in degrees (same convention as HUD) from a Rodrigues vector."""
     R, _ = cv2.Rodrigues(rvec)
     sy = float(np.sqrt(R[0,0]**2 + R[1,0]**2))
     if sy > 1e-6:
@@ -963,6 +1121,7 @@ def _pose_to_euler_zyx_deg(rvec):
 
 
 def _next_pose_csv_path(base_dir: Path) -> Path:
+    """First non-existing ``poses{i}.csv`` in ``base_dir`` (typically cwd)."""
     i = 1
     while True:
         p = base_dir / f"poses{i}.csv"
@@ -971,6 +1130,12 @@ def _next_pose_csv_path(base_dir: Path) -> Path:
 
 
 def run(args) -> None:
+    """
+    End-to-end live demo: load EdgeTAM, capture, pick seeds, SAM3D meshes, track.
+
+    Exits early if checkpoint missing, device is CPU-only, capture fails, the user
+    cancels seeding, or SAM3D returns no estimators.
+    """
     device = choose_device(args.device)
     if device == "cpu":
         print("GPU required. Use --device mps or --device cuda."); return
@@ -1233,7 +1398,12 @@ def run(args) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="EdgeTAM surgical tool tracker. ID1=scissors (11.75cm).")
+    parser = argparse.ArgumentParser(
+        description=(
+            "EdgeTAM live surgical tool tracking with SAM3D mesh bootstrap. "
+            "ID1 is scissors (11.75 cm metric reference); use --object-classes for other IDs."
+        ),
+    )
     parser.add_argument("--camera", type=str, default="")
     parser.add_argument("--device", default="auto", choices=["auto","cuda","mps","cpu"])
     parser.add_argument("--object-classes", nargs="*", default=[],
@@ -1250,7 +1420,11 @@ def main() -> None:
     parser.add_argument("--intrinsics-file",  default="")
     parser.add_argument("--no-orbbec-intrinsics", action="store_true")
     parser.add_argument("--align-debug-out",  default="")
-    parser.add_argument("--overlay-frames-dir", default=str(Path(__file__).parent / "mesh_overlay_frames"))
+    parser.add_argument(
+        "--overlay-frames-dir",
+        default="",
+        help="Optional directory to export per-frame debug overlays. Disabled by default.",
+    )
     parser.add_argument("--synthetic-image",  default=str(Path(__file__).parent / "testing.jpg"))
     parser.add_argument("--synthetic-frames", type=int,   default=100)
     parser.add_argument("--synthetic-fps",    type=float, default=30.0)
