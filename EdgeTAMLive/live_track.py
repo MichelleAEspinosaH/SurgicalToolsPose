@@ -380,6 +380,10 @@ def _resolve_pose_intrinsics(cap, target_w, target_h, intrinsics_file, try_orbbe
 # ---------------------------------------------------------------------------
 
 def _normalize_mesh_to_known_length(
+#     verts: np.ndarray,
+#     obj_id: int,
+#     object_class: str,
+# ) -> np.ndarray:
     verts: np.ndarray,
     obj_id: int,
     object_class: str,
@@ -395,18 +399,33 @@ def _normalize_mesh_to_known_length(
     SAM3D produces meshes in arbitrary normalised units (~0–1).  Without this
     rescaling the PnP tvec Z has no physical meaning and reprojection fails.
     """
+    # if obj_id in OBJECT_ID_LENGTH_M:
+    #     target_m = OBJECT_ID_LENGTH_M[obj_id]
+    #     src = f"ID{obj_id} measured ({target_m*100:.2f} cm)"
+    # else:
+    #     target_m = CLASS_EXTENTS_M.get(object_class, CLASS_EXTENTS_M["tool"])
+    #     src = f"class={object_class} ({target_m*100:.1f} cm)"
+
+    # longest = float((verts.max(0) - verts.min(0)).max())
+    # if longest < 1e-9:
+    #     return verts
+    # scale = target_m / longest
+    # print(f"  [mesh scale] {src}  raw longest={longest:.4f}  scale×{scale:.5f}")
+    # return verts * scale
     if obj_id in OBJECT_ID_LENGTH_M:
         target_m = OBJECT_ID_LENGTH_M[obj_id]
-        src = f"ID{obj_id} measured ({target_m*100:.2f} cm)"
     else:
         target_m = CLASS_EXTENTS_M.get(object_class, CLASS_EXTENTS_M["tool"])
-        src = f"class={object_class} ({target_m*100:.1f} cm)"
 
-    longest = float((verts.max(0) - verts.min(0)).max())
-    if longest < 1e-9:
+    # ✅ robust extent (percentile instead of min/max)
+    p95 = np.percentile(verts, 95, axis=0)
+    p5  = np.percentile(verts, 5, axis=0)
+    extent = (p95 - p5).max()
+
+    if extent < 1e-9:
         return verts
-    scale = target_m / longest
-    print(f"  [mesh scale] {src}  raw longest={longest:.4f}  scale×{scale:.5f}")
+
+    scale = target_m / extent
     return verts * scale
 
 # ---------------------------------------------------------------------------
@@ -1006,7 +1025,7 @@ def _draw_pose_axes(vis, state, K, dist, axis_pts, obj_id):
     cv2.putText(vis, "Z", (z_tip[0]+4, z_tip[1]+4), fnt, 0.50, (220, 80,  0), 1, cv2.LINE_AA)
 
 
-def _draw_pose_hud(vis, pose_states):
+def _draw_pose_hud(vis, pose_states, translation_scale: float = 1.0):
     """Overlay Euler + translation text for each tracked object id."""
     if not pose_states:
         return
@@ -1026,7 +1045,7 @@ def _draw_pose_hud(vis, pose_states):
         else:
             rx = np.degrees(np.arctan2(-float(R[1,2]), float(R[1,1])))
             ry = np.degrees(np.arctan2(-float(R[2,0]), sy)); rz = 0.0
-        tv  = np.asarray(tvec, dtype=np.float64).reshape(-1)
+        tv = np.asarray(tvec, dtype=np.float64).reshape(-1) * float(translation_scale)
         tag = " (scissors)" if oid == 1 else ""
         text = f"ID{oid}{tag}  R({rx:.0f},{ry:.0f},{rz:.0f})  T({tv[0]:.3f},{tv[1]:.3f},{tv[2]:.3f}m)"
         yy = 18 + row * 18
@@ -1352,6 +1371,13 @@ def run(args) -> None:
     com_trails:  dict[int, list[tuple[int,int]]] = {}
     pose_states: dict[int, dict]                 = {}
     MAX_TRAIL = 60
+    translation_scale = 1.0
+    depth_calibrated = not bool(args.id1_depth_calibration)
+    if args.id1_depth_calibration:
+        print(
+            "ID1 depth auto-calibration enabled: "
+            f"target={float(args.id1_known_distance_m):.3f} m"
+        )
 
     # Init pose from seed masks
     for i in range(min(len(_seed_ids), _seed_masks_np.shape[0])):
@@ -1363,6 +1389,24 @@ def run(args) -> None:
             pose_states[oid] = est.estimate_pose(
                 binm, K_cam, dist_cam, pose_states.get(oid),
             )
+
+    # Depth calibration must be based on the frozen seed frame, not stream frame 1+.
+    if args.id1_depth_calibration:
+        st1 = pose_states.get(1, {})
+        tv1 = np.asarray(st1.get("tvec"), dtype=np.float64).reshape(-1) if st1.get("tvec") is not None else None
+        if tv1 is not None and tv1.size >= 3 and float(tv1[2]) > 1e-6:
+            translation_scale = float(args.id1_known_distance_m) / float(tv1[2])
+            depth_calibrated = True
+            print(
+                "ID1 depth calibrated on frozen frame: "
+                f"z_measured={float(tv1[2]):.4f} m -> scale={translation_scale:.4f}"
+            )
+        else:
+            print(
+                "ID1 depth calibration on frozen frame failed (no valid ID1 seed pose); "
+                "leaving translation scale at 1.0."
+            )
+            depth_calibrated = True
 
     fps_t0, fps_frames = time.perf_counter(), 0
     ac_device, ac_dtype, ac_enabled = _autocast_config(device, args.half)
@@ -1418,7 +1462,7 @@ def run(args) -> None:
                         cv2.putText(vis, f"ID{oid}", (lp[0]+8, lp[1]-8),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1, cv2.LINE_AA)
 
-                _draw_pose_hud(vis, pose_states)
+                _draw_pose_hud(vis, pose_states, translation_scale=translation_scale)
 
                 if fi == 0:
                     for oid, px, py in points:
@@ -1442,7 +1486,7 @@ def run(args) -> None:
                     rvec = st.get("rvec"); tvec = st.get("tvec")
                     if rvec is None or tvec is None: continue
                     rx, ry, rz = _pose_to_euler_zyx_deg(rvec)
-                    tv = np.asarray(tvec, dtype=np.float64).reshape(-1)
+                    tv = np.asarray(tvec, dtype=np.float64).reshape(-1) * float(translation_scale)
                     if tv.size < 3: continue
                     csv_writer.writerow([
                         int(fi), t_s, oid, object_classes.get(oid, "tool"),
@@ -1487,6 +1531,25 @@ def main() -> None:
     parser.add_argument("--sam3d-output-dir", default=str(Path(__file__).parent / "sam3d_live_bootstrap"))
     parser.add_argument("--intrinsics-file",  default="")
     parser.add_argument("--no-orbbec-intrinsics", action="store_true")
+    parser.add_argument(
+        "--id1-known-distance-m",
+        type=float,
+        default=0.30,
+        help="Known camera-to-scissors depth in metres for one-shot translation scaling.",
+    )
+    parser.add_argument(
+        "--id1-depth-calibration",
+        dest="id1_depth_calibration",
+        action="store_true",
+        default=True,
+        help="Enable one-shot translation scale calibration using ID1 depth.",
+    )
+    parser.add_argument(
+        "--no-id1-depth-calibration",
+        dest="id1_depth_calibration",
+        action="store_false",
+        help="Disable one-shot translation scale calibration.",
+    )
     parser.add_argument("--align-debug-out",  default="")
     parser.add_argument(
         "--overlay-frames-dir",
