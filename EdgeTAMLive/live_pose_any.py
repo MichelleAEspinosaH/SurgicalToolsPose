@@ -82,10 +82,6 @@ _REG_MAXITER_TRACK = 14
 AXIS_LENGTH_PX = 60
 # Match live_track.py default COM trail cap.
 _MAX_COM_TRAIL = 60
-KALMAN_PROCESS_VAR = 2e-4
-KALMAN_MEAS_VAR = 4e-3
-TRACK_ROT_SMOOTH_W = 0.04
-TRACK_TRANS_SMOOTH_W = 7.0
 
 
 def _euler_zyx_deg_from_rvec(rvec: np.ndarray) -> tuple[float, float, float]:
@@ -656,59 +652,6 @@ def _smooth_pose_state(state: dict, alpha_t: float, alpha_r: float) -> None:
     state["rvec"] = (1.0 - a_r) * rv_prev + a_r * rv_raw
 
 
-def _rotation_delta_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
-    """Geodesic angular difference between two Rodrigues rotations."""
-    Ra, _ = cv2.Rodrigues(np.asarray(rvec_a, dtype=np.float64).reshape(3, 1))
-    Rb, _ = cv2.Rodrigues(np.asarray(rvec_b, dtype=np.float64).reshape(3, 1))
-    R = Ra @ Rb.T
-    tr = float(np.trace(R))
-    c = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
-    return float(np.degrees(np.arccos(c)))
-
-
-class KalmanScalar:
-    def __init__(self, process_var: float, meas_var: float):
-        self.q = max(float(process_var), 1e-12)
-        self.r = max(float(meas_var), 1e-12)
-        self.x: float | None = None
-        self.p: float = 1.0
-
-    def filter(self, z: float) -> float:
-        z = float(z)
-        if self.x is None:
-            self.x = z
-            self.p = 1.0
-            return z
-        self.p += self.q
-        k = self.p / (self.p + self.r)
-        self.x = self.x + k * (z - self.x)
-        self.p = (1.0 - k) * self.p
-        return self.x
-
-
-def _apply_kalman_pose_filter(
-    state: dict,
-    rv: np.ndarray,
-    tv: np.ndarray,
-    process_var: float,
-    meas_var: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    filters = state.get("kalman_filters")
-    if filters is None or len(filters) != 6:
-        filters = [KalmanScalar(process_var, meas_var) for _ in range(6)]
-        state["kalman_filters"] = filters
-    vec = np.concatenate(
-        [
-            np.asarray(rv, dtype=np.float64).reshape(3),
-            np.asarray(tv, dtype=np.float64).reshape(3),
-        ]
-    )
-    out = np.empty_like(vec)
-    for i in range(6):
-        out[i] = filters[i].filter(float(vec[i]))
-    return out[:3].reshape(3, 1), out[3:].reshape(3, 1)
-
-
 def _init_keypoint_track_state(
     frame_bgr: np.ndarray,
     mask_bool: np.ndarray,
@@ -746,9 +689,6 @@ def _update_pose_from_keypoint_track(
     base_pose: dict,
     K: np.ndarray,
     mask_hint: np.ndarray | None = None,
-    prev_pose: dict | None = None,
-    rot_smooth_w: float = TRACK_ROT_SMOOTH_W,
-    trans_smooth_w: float = TRACK_TRANS_SMOOTH_W,
 ) -> tuple[dict | None, dict]:
     """
     Track keypoints with LK flow and map 2D similarity motion to pose deltas
@@ -825,24 +765,6 @@ def _update_pose_from_keypoint_track(
     inl_ratio = 0.0
     if inliers is not None and inliers.size > 0:
         inl_ratio = float(np.mean(inliers.reshape(-1) > 0))
-
-    if prev_pose is not None and prev_pose.get("rvec") is not None and prev_pose.get("tvec") is not None:
-        rv_prev = np.asarray(prev_pose.get("rvec"), dtype=np.float64).reshape(3, 1)
-        tv_prev = np.asarray(prev_pose.get("tvec"), dtype=np.float64).reshape(3, 1)
-        d_rot = _rotation_delta_deg(r_new, rv_prev)
-        z_ref = max(abs(float(tv_prev[2, 0])), 1e-6)
-        d_t = float(np.linalg.norm(t_new.reshape(3) - tv_prev.reshape(3)) / z_ref)
-        smooth_pen = float(rot_smooth_w) * d_rot + float(trans_smooth_w) * d_t
-        smooth_scale = 1.0 / (1.0 + smooth_pen)
-        if smooth_scale < 0.25:
-            nxt_track["ref_pts"] = ref_pts.astype(np.float32)
-            nxt_track["prev_pts"] = prev_pts.astype(np.float32)
-            nxt_track["inlier_ratio"] = inl_ratio
-            nxt_track["n_pts"] = int(prev_pts.shape[0])
-            return None, nxt_track
-        blend = float(np.clip(0.55 + 0.45 * smooth_scale, 0.15, 1.0))
-        r_new = (1.0 - blend) * rv_prev + blend * r_new
-        t_new = (1.0 - blend) * tv_prev + blend * t_new
 
     nxt_track["ref_pts"] = src.astype(np.float32)
     nxt_track["prev_pts"] = dst.astype(np.float32)
@@ -1169,6 +1091,84 @@ def _wait_fal_progress_ui(
     return results
 
 
+def _confirm_seed_masks_ui(
+    seed_frame: np.ndarray,
+    seed_mask_bool: dict[int, np.ndarray],
+    win_name: str = "Confirm seed masks",
+) -> bool:
+    """
+    Show frozen-frame mask overlay and wait for explicit user confirmation.
+    Returns True to proceed to SAM3D upload, False to abort.
+    """
+    ids = sorted(seed_mask_bool.keys())
+    if not ids:
+        return False
+
+    vis = seed_frame.copy().astype(np.float32)
+    for oid in ids:
+        mb = seed_mask_bool.get(oid)
+        if mb is None or not np.any(mb):
+            continue
+        c = np.array(point_color(int(oid)), dtype=np.float32)
+        vis[mb] = vis[mb] * 0.35 + c * 0.65
+        ys, xs = np.where(mb)
+        if xs.size > 0:
+            cx, cy = int(xs.mean()), int(ys.mean())
+            cv2.putText(
+                vis,
+                f"ID{oid}",
+                (cx + 8, cy - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                vis,
+                f"ID{oid}",
+                (cx + 8, cy - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    vis_u8 = vis.astype(np.uint8)
+    cv2.namedWindow(win_name)
+    while True:
+        panel = vis_u8.copy()
+        cv2.putText(
+            panel,
+            "Confirm masks before SAM3D upload",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.70,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            "Enter / Y: continue    R / N / ESC: abort",
+            (12, 56),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (230, 230, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.imshow(win_name, panel)
+        k = cv2.waitKey(30) & 0xFF
+        if k in (13, 10, ord("y"), ord("Y")):
+            cv2.destroyWindow(win_name)
+            return True
+        if k in (ord("r"), ord("R"), ord("n"), ord("N"), ord("q"), 27):
+            cv2.destroyWindow(win_name)
+            return False
+
+
 def run(args: argparse.Namespace) -> None:
     device = choose_device(args.device)
     print(f"Device: {device}")
@@ -1265,6 +1265,13 @@ def run(args: argparse.Namespace) -> None:
     print(
         f"Timing: obtain_masks (EdgeTAM frame 0 + binarize + outer fill) = {t_masks_s:.3f} s"
     )
+    print("Please confirm seed masks before sending to SAM3D …")
+    if not _confirm_seed_masks_ui(seed_frame, seed_mask_bool):
+        print("Seed mask confirmation declined. Aborting before SAM3D upload.")
+        stop_flag.set()
+        cap.release()
+        cv2.destroyAllWindows()
+        return
 
     t_3d0 = time.perf_counter()
     work_dir = Path(args.glb_dir).expanduser().resolve()
@@ -1445,9 +1452,6 @@ def run(args: argparse.Namespace) -> None:
                                     bp,
                                     K_cam,
                                     mask_hint=binm,
-                                    prev_pose=st,
-                                    rot_smooth_w=float(args.track_rot_smooth_w),
-                                    trans_smooth_w=float(args.track_trans_smooth_w),
                                 )
                                 stage_t["track"] += time.perf_counter() - t0
                                 stage_n["track"] += 1
@@ -1459,15 +1463,6 @@ def run(args: argparse.Namespace) -> None:
                                     st["track_inlier_ratio"] = float(pose_kp.get("track_inlier_ratio", 0.0))
                                     st["track_points"] = int(pose_kp.get("track_points", 0))
                                     _snap_pose_xy_to_mask_com(st, cx, cy, K_cam, alpha=0.90)
-                                    rv_f, tv_f = _apply_kalman_pose_filter(
-                                        st,
-                                        np.asarray(st["rvec_raw"], dtype=np.float64).reshape(3, 1),
-                                        np.asarray(st["tvec_raw"], dtype=np.float64).reshape(3, 1),
-                                        float(args.kalman_process_var),
-                                        float(args.kalman_meas_var),
-                                    )
-                                    st["rvec"] = rv_f
-                                    st["tvec"] = tv_f
                                 else:
                                     st["last_solver"] = "keypoint_track_lost"
                             else:
@@ -1640,30 +1635,6 @@ def main() -> None:
         type=float,
         default=0.008,
         help="Fast local search step for translation Z (camera units).",
-    )
-    parser.add_argument(
-        "--kalman-process-var",
-        type=float,
-        default=KALMAN_PROCESS_VAR,
-        help="Kalman process variance Q for 6DoF smoothing.",
-    )
-    parser.add_argument(
-        "--kalman-meas-var",
-        type=float,
-        default=KALMAN_MEAS_VAR,
-        help="Kalman measurement variance R for 6DoF smoothing.",
-    )
-    parser.add_argument(
-        "--track-rot-smooth-w",
-        type=float,
-        default=TRACK_ROT_SMOOTH_W,
-        help="Continuity penalty weight for rotation jumps in keypoint tracking.",
-    )
-    parser.add_argument(
-        "--track-trans-smooth-w",
-        type=float,
-        default=TRACK_TRANS_SMOOTH_W,
-        help="Continuity penalty weight for translation jumps in keypoint tracking.",
     )
     parser.add_argument(
         "--align-refresh-every",
