@@ -76,12 +76,16 @@ from live_track_copy import (
 
 # Match live_track_copy registration hyperparameters.
 _REG_NEIGHBORHOOD_W = 0.02
-_REG_MAXITER_FIRST = 40
-_REG_MAXITER_TRACK = 22
+_REG_MAXITER_FIRST = 28
+_REG_MAXITER_TRACK = 14
 
 AXIS_LENGTH_PX = 60
 # Match live_track.py default COM trail cap.
 _MAX_COM_TRAIL = 60
+KALMAN_PROCESS_VAR = 2e-4
+KALMAN_MEAS_VAR = 4e-3
+TRACK_ROT_SMOOTH_W = 0.04
+TRACK_TRANS_SMOOTH_W = 7.0
 
 
 def _euler_zyx_deg_from_rvec(rvec: np.ndarray) -> tuple[float, float, float]:
@@ -186,8 +190,8 @@ class NativeAxisMesh:
         self.mesh_vertices = verts
         self.mesh_faces = faces
         # Cached vertex subsets for DT-based registration hot paths.
-        self.sample_vertices_relock = _uniform_vertex_samples(verts, max_points=1400)
-        self.sample_vertices_fast = _uniform_vertex_samples(verts, max_points=900)
+        self.sample_vertices_relock = _uniform_vertex_samples(verts, max_points=900)
+        self.sample_vertices_fast = _uniform_vertex_samples(verts, max_points=480)
         mn = verts.min(axis=0)
         mx = verts.max(axis=0)
         self.extents = (mx - mn).astype(np.float64)
@@ -340,6 +344,7 @@ def _prepare_mask_dt(mask_bool: np.ndarray) -> dict:
     """
     mask_u8 = (mask_bool.astype(np.uint8) * 255)
     inv = 255 - mask_u8
+    # maskSize=3 is noticeably cheaper than 5 with little impact on pose gating.
     dt_outside = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
     ys, xs = np.where(mask_bool)
     if ys.size > 0:
@@ -353,6 +358,59 @@ def _prepare_mask_dt(mask_bool: np.ndarray) -> dict:
         "mask_cx": cx,
         "mask_cy": cy,
     }
+
+
+def _dt_sample_stats(
+    verts_sample: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    dt_ctx: dict,
+    fh: int,
+    fw: int,
+) -> dict | None:
+    """Project mesh samples and summarize distance-to-mask boundary (single projectPoints)."""
+    if verts_sample.size == 0:
+        return None
+    proj, _ = cv2.projectPoints(verts_sample, rvec, tvec, K, dist)
+    pts = proj.reshape(-1, 2)
+    xs = np.round(pts[:, 0]).astype(np.int32)
+    ys = np.round(pts[:, 1]).astype(np.int32)
+    inside = (xs >= 0) & (xs < fw) & (ys >= 0) & (ys < fh)
+    if not np.any(inside):
+        return None
+    xs_i = xs[inside]
+    ys_i = ys[inside]
+    dt_out = dt_ctx["dt_outside"][ys_i, xs_i]
+    mean_out = float(np.mean(dt_out)) if dt_out.size > 0 else 1e6
+    outside_ratio = float(np.mean(dt_out > 0.5)) if dt_out.size > 0 else 1.0
+    x0 = float(xs_i.min())
+    x1 = float(xs_i.max())
+    y0 = float(ys_i.min())
+    y1 = float(ys_i.max())
+    proj_area = max(1.0, (x1 - x0 + 1.0) * (y1 - y0 + 1.0))
+    cx_p = float(xs_i.mean())
+    cy_p = float(ys_i.mean())
+    cdist = float(np.hypot(cx_p - float(dt_ctx["mask_cx"]), cy_p - float(dt_ctx["mask_cy"])))
+    return {
+        "mean_out": mean_out,
+        "outside_ratio": outside_ratio,
+        "inside_frac": float(1.0 - outside_ratio),
+        "proj_area": proj_area,
+        "centroid_px": cdist,
+    }
+
+
+def _dt_pose_score_from_stats(stats: dict, dt_ctx: dict) -> float:
+    """Higher is better (same objective as previous _dt_pose_score)."""
+    mean_out = float(stats["mean_out"])
+    outside_ratio = float(stats["outside_ratio"])
+    proj_area = float(stats["proj_area"])
+    mask_area = max(1.0, float(dt_ctx["mask_area"]))
+    area_pen = abs(float(np.log((proj_area + 1.0) / (mask_area + 1.0))))
+    cdist = float(stats["centroid_px"])
+    return float(-(0.90 * mean_out + 6.5 * outside_ratio + 0.35 * area_pen + 0.03 * cdist))
 
 
 def _dt_pose_score(
@@ -369,36 +427,10 @@ def _dt_pose_score(
     Fast score from projected sample points and mask distance transform.
     Higher is better.
     """
-    if verts_sample.size == 0:
+    st = _dt_sample_stats(verts_sample, rvec, tvec, K, dist, dt_ctx, fh, fw)
+    if st is None:
         return -1e9
-    proj, _ = cv2.projectPoints(verts_sample, rvec, tvec, K, dist)
-    pts = proj.reshape(-1, 2)
-    xs = np.round(pts[:, 0]).astype(np.int32)
-    ys = np.round(pts[:, 1]).astype(np.int32)
-    inside = (xs >= 0) & (xs < fw) & (ys >= 0) & (ys < fh)
-    if not np.any(inside):
-        return -1e9
-    xs_i = xs[inside]
-    ys_i = ys[inside]
-    dt_out = dt_ctx["dt_outside"][ys_i, xs_i]
-    mean_out = float(np.mean(dt_out)) if dt_out.size > 0 else 1e6
-    outside_ratio = float(np.mean(dt_out > 0.5)) if dt_out.size > 0 else 1.0
-
-    # Keep projected sample spread roughly in the same scale as mask area.
-    x0 = float(xs_i.min())
-    x1 = float(xs_i.max())
-    y0 = float(ys_i.min())
-    y1 = float(ys_i.max())
-    proj_area = max(1.0, (x1 - x0 + 1.0) * (y1 - y0 + 1.0))
-    mask_area = max(1.0, float(dt_ctx["mask_area"]))
-    area_pen = abs(float(np.log((proj_area + 1.0) / (mask_area + 1.0))))
-
-    # Center consistency also helps avoid drift in low-texture motion.
-    cx_p = float(xs_i.mean())
-    cy_p = float(ys_i.mean())
-    cdist = float(np.hypot(cx_p - float(dt_ctx["mask_cx"]), cy_p - float(dt_ctx["mask_cy"])))
-
-    return float(-(0.90 * mean_out + 6.5 * outside_ratio + 0.35 * area_pen + 0.03 * cdist))
+    return _dt_pose_score_from_stats(st, dt_ctx)
 
 
 def _p0_native_extent_seed(
@@ -422,6 +454,9 @@ def _p0_native_extent_seed(
 
     tv = np.asarray(t_init, dtype=np.float64).reshape(3, 1)
     verts_s = est.mesh_vertices * s.reshape(1, 3)
+    fh, fw = mask_bool.shape[:2]
+    dt_ctx = _prepare_mask_dt(mask_bool)
+    verts_sample = _uniform_vertex_samples(verts_s, max_points=520)
 
     ax0 = np.zeros(3, dtype=np.float64)
     ax0[i0] = 1.0
@@ -438,7 +473,7 @@ def _p0_native_extent_seed(
             r = (r_align @ r_tw).astype(np.float64)
             rvec, _ = cv2.Rodrigues(r)
             rv = rvec.astype(np.float64)
-            sc = _containment_from_pose(mask_bool, verts_s, est.mesh_faces, rv, tv, K, dist)
+            sc = _dt_pose_score(verts_sample, rv, tv, K, dist, dt_ctx, fh, fw)
             if sc > best_score:
                 best_score = sc
                 best_R = r.copy()
@@ -509,7 +544,7 @@ def _register_rigid_containment(
             if seed is not None:
                 p0 = seed.astype(np.float64)
 
-        def _obj(p: np.ndarray, p0_ref=p0, vs=verts_s) -> float:
+        def _obj(p: np.ndarray, p0_ref=p0) -> float:
             rv = np.asarray(p[:3], dtype=np.float64).reshape(3, 1)
             tv = np.asarray(p[3:], dtype=np.float64).reshape(3, 1)
             sc = _dt_pose_score(verts_sample, rv, tv, K, dist, dt_ctx, fh, fw)
@@ -550,8 +585,12 @@ def _pose_alignment_metrics(
     K: np.ndarray,
     dist: np.ndarray,
     state: dict,
+    dt_ctx: dict | None = None,
 ) -> dict:
-    """Compute overlap and geometric quality metrics for current pose."""
+    """
+    Fast overlap / quality proxies from DT + projected samples (no full mesh rasterization).
+    For true mask-vs-mesh IoU, use the alignment debug window only.
+    """
     rvec = state.get("rvec")
     tvec = state.get("tvec")
     if rvec is None or tvec is None or not np.any(mask_bool):
@@ -559,32 +598,27 @@ def _pose_alignment_metrics(
 
     fh, fw = mask_bool.shape[:2]
     s = _reg_sign_from_state(state)
-    verts_s = est.mesh_vertices * s.reshape(1, 3)
-    mesh_u8 = _mesh_silhouette_u8(verts_s, est.mesh_faces, rvec, tvec, K, dist, fh, fw)
-    mask_u8 = mask_bool.astype(np.uint8) * 255
-    iou, dice = _mask_iou_dice(mask_u8, mesh_u8)
-    containment = _containment_metric(mask_bool, mesh_u8 > 0)
+    verts_base = getattr(est, "sample_vertices_fast", est.mesh_vertices)
+    verts_sample = np.asarray(verts_base, dtype=np.float64) * s.reshape(1, 3)
+    if dt_ctx is None:
+        dt_ctx = _prepare_mask_dt(mask_bool)
+    st = _dt_sample_stats(verts_sample, rvec, tvec, K, dist, dt_ctx, fh, fw)
+    if st is None:
+        return {"iou": 0.0, "dice": 0.0, "containment": -1.0, "centroid_px": 1e9}
 
-    ys, xs = np.where(mask_bool)
-    if ys.size == 0:
-        centroid_px = 1e9
-    else:
-        mx, my = float(xs.mean()), float(ys.mean())
-        o_proj, _ = cv2.projectPoints(
-            np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
-            np.asarray(rvec, dtype=np.float64).reshape(3, 1),
-            np.asarray(tvec, dtype=np.float64).reshape(3, 1),
-            K,
-            dist,
-        )
-        ox, oy = o_proj.reshape(-1, 2)[0]
-        centroid_px = float(np.hypot(mx - float(ox), my - float(oy)))
+    mean_out = float(st["mean_out"])
+    inside_frac = float(st["inside_frac"])
+    centroid_px = float(st["centroid_px"])
+    # Map DT stats into [0,1] proxies compatible with the HUD confidence blend.
+    iou = float(np.clip(inside_frac * np.exp(-mean_out / 20.0), 0.0, 1.0))
+    dice = float(np.clip(2.0 * iou / (iou + 1.0 + 1e-6), 0.0, 1.0))
+    containment = float(inside_frac - 0.08 * min(mean_out / 40.0, 1.0))
 
     return {
-        "iou": float(iou),
-        "dice": float(dice),
-        "containment": float(containment),
-        "centroid_px": float(centroid_px),
+        "iou": iou,
+        "dice": dice,
+        "containment": containment,
+        "centroid_px": centroid_px,
     }
 
 
@@ -622,6 +656,251 @@ def _smooth_pose_state(state: dict, alpha_t: float, alpha_r: float) -> None:
     state["rvec"] = (1.0 - a_r) * rv_prev + a_r * rv_raw
 
 
+def _rotation_delta_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
+    """Geodesic angular difference between two Rodrigues rotations."""
+    Ra, _ = cv2.Rodrigues(np.asarray(rvec_a, dtype=np.float64).reshape(3, 1))
+    Rb, _ = cv2.Rodrigues(np.asarray(rvec_b, dtype=np.float64).reshape(3, 1))
+    R = Ra @ Rb.T
+    tr = float(np.trace(R))
+    c = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(c)))
+
+
+class KalmanScalar:
+    def __init__(self, process_var: float, meas_var: float):
+        self.q = max(float(process_var), 1e-12)
+        self.r = max(float(meas_var), 1e-12)
+        self.x: float | None = None
+        self.p: float = 1.0
+
+    def filter(self, z: float) -> float:
+        z = float(z)
+        if self.x is None:
+            self.x = z
+            self.p = 1.0
+            return z
+        self.p += self.q
+        k = self.p / (self.p + self.r)
+        self.x = self.x + k * (z - self.x)
+        self.p = (1.0 - k) * self.p
+        return self.x
+
+
+def _apply_kalman_pose_filter(
+    state: dict,
+    rv: np.ndarray,
+    tv: np.ndarray,
+    process_var: float,
+    meas_var: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    filters = state.get("kalman_filters")
+    if filters is None or len(filters) != 6:
+        filters = [KalmanScalar(process_var, meas_var) for _ in range(6)]
+        state["kalman_filters"] = filters
+    vec = np.concatenate(
+        [
+            np.asarray(rv, dtype=np.float64).reshape(3),
+            np.asarray(tv, dtype=np.float64).reshape(3),
+        ]
+    )
+    out = np.empty_like(vec)
+    for i in range(6):
+        out[i] = filters[i].filter(float(vec[i]))
+    return out[:3].reshape(3, 1), out[3:].reshape(3, 1)
+
+
+def _init_keypoint_track_state(
+    frame_bgr: np.ndarray,
+    mask_bool: np.ndarray,
+    max_points: int = 120,
+) -> dict | None:
+    """Seed object-specific keypoints on frozen frame (inside mask)."""
+    if not np.any(mask_bool):
+        return None
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    roi = (mask_bool.astype(np.uint8) * 255)
+    pts = cv2.goodFeaturesToTrack(
+        gray,
+        maxCorners=max(20, int(max_points)),
+        qualityLevel=0.01,
+        minDistance=5,
+        mask=roi,
+        blockSize=7,
+        useHarrisDetector=False,
+    )
+    if pts is None or len(pts) < 8:
+        return None
+    ref = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    return {
+        "ref_pts": ref.copy(),
+        "prev_pts": ref.copy(),
+        "min_pts": 8,
+        "max_pts": max(20, int(max_points)),
+    }
+
+
+def _update_pose_from_keypoint_track(
+    track_state: dict,
+    prev_gray: np.ndarray,
+    curr_gray: np.ndarray,
+    base_pose: dict,
+    K: np.ndarray,
+    mask_hint: np.ndarray | None = None,
+    prev_pose: dict | None = None,
+    rot_smooth_w: float = TRACK_ROT_SMOOTH_W,
+    trans_smooth_w: float = TRACK_TRANS_SMOOTH_W,
+) -> tuple[dict | None, dict]:
+    """
+    Track keypoints with LK flow and map 2D similarity motion to pose deltas
+    relative to the frozen-frame registered pose.
+    """
+    ref_pts = np.asarray(track_state.get("ref_pts", np.zeros((0, 2), np.float32)), dtype=np.float32)
+    prev_pts = np.asarray(track_state.get("prev_pts", np.zeros((0, 2), np.float32)), dtype=np.float32)
+    if ref_pts.shape[0] < int(track_state.get("min_pts", 8)) or prev_pts.shape != ref_pts.shape:
+        return None, track_state
+
+    p_prev = prev_pts.reshape(-1, 1, 2)
+    p_next, st, _ = cv2.calcOpticalFlowPyrLK(
+        prev_gray,
+        curr_gray,
+        p_prev,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+    )
+    if p_next is None or st is None:
+        return None, track_state
+
+    good = st.reshape(-1) > 0
+    if mask_hint is not None and np.any(mask_hint):
+        xy = np.round(p_next.reshape(-1, 2)).astype(np.int32)
+        valid = (
+            (xy[:, 0] >= 0)
+            & (xy[:, 0] < mask_hint.shape[1])
+            & (xy[:, 1] >= 0)
+            & (xy[:, 1] < mask_hint.shape[0])
+        )
+        in_mask = np.zeros_like(valid, dtype=bool)
+        in_mask[valid] = mask_hint[xy[valid, 1], xy[valid, 0]]
+        good &= (in_mask | (~valid))
+
+    src = ref_pts[good]
+    dst = p_next.reshape(-1, 2)[good]
+    if src.shape[0] < int(track_state.get("min_pts", 8)):
+        return None, track_state
+
+    A, inliers = cv2.estimateAffinePartial2D(
+        src,
+        dst,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=3.0,
+        maxIters=200,
+        confidence=0.98,
+        refineIters=10,
+    )
+    if A is None:
+        return None, track_state
+
+    a, b, tx = float(A[0, 0]), float(A[0, 1]), float(A[0, 2])
+    c, d, ty = float(A[1, 0]), float(A[1, 1]), float(A[1, 2])
+    scale = float(np.sqrt(max(1e-9, a * a + c * c)))
+    theta = float(np.arctan2(c, a))
+
+    r_base = np.asarray(base_pose.get("rvec"), dtype=np.float64).reshape(3, 1)
+    t_base = np.asarray(base_pose.get("tvec"), dtype=np.float64).reshape(3, 1)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+
+    z_new = float(np.clip(float(t_base[2, 0]) / max(0.45, min(2.2, scale)), 0.04, 8.0))
+    t_new = t_base.copy()
+    t_new[2, 0] = z_new
+    t_new[0, 0] = float(t_base[0, 0]) + (tx / fx) * z_new
+    t_new[1, 0] = float(t_base[1, 0]) + (ty / fy) * z_new
+
+    Rb, _ = cv2.Rodrigues(r_base)
+    Rz, _ = cv2.Rodrigues(np.array([0.0, 0.0, theta], dtype=np.float64).reshape(3, 1))
+    r_new, _ = cv2.Rodrigues((Rz @ Rb).astype(np.float64))
+
+    nxt_track = track_state.copy()
+    inl_ratio = 0.0
+    if inliers is not None and inliers.size > 0:
+        inl_ratio = float(np.mean(inliers.reshape(-1) > 0))
+
+    if prev_pose is not None and prev_pose.get("rvec") is not None and prev_pose.get("tvec") is not None:
+        rv_prev = np.asarray(prev_pose.get("rvec"), dtype=np.float64).reshape(3, 1)
+        tv_prev = np.asarray(prev_pose.get("tvec"), dtype=np.float64).reshape(3, 1)
+        d_rot = _rotation_delta_deg(r_new, rv_prev)
+        z_ref = max(abs(float(tv_prev[2, 0])), 1e-6)
+        d_t = float(np.linalg.norm(t_new.reshape(3) - tv_prev.reshape(3)) / z_ref)
+        smooth_pen = float(rot_smooth_w) * d_rot + float(trans_smooth_w) * d_t
+        smooth_scale = 1.0 / (1.0 + smooth_pen)
+        if smooth_scale < 0.25:
+            nxt_track["ref_pts"] = ref_pts.astype(np.float32)
+            nxt_track["prev_pts"] = prev_pts.astype(np.float32)
+            nxt_track["inlier_ratio"] = inl_ratio
+            nxt_track["n_pts"] = int(prev_pts.shape[0])
+            return None, nxt_track
+        blend = float(np.clip(0.55 + 0.45 * smooth_scale, 0.15, 1.0))
+        r_new = (1.0 - blend) * rv_prev + blend * r_new
+        t_new = (1.0 - blend) * tv_prev + blend * t_new
+
+    nxt_track["ref_pts"] = src.astype(np.float32)
+    nxt_track["prev_pts"] = dst.astype(np.float32)
+    nxt_track["inlier_ratio"] = inl_ratio
+    nxt_track["n_pts"] = int(dst.shape[0])
+
+    pose = {
+        "rvec_raw": r_new.astype(np.float64),
+        "tvec_raw": t_new.astype(np.float64),
+        "rvec": r_new.astype(np.float64),
+        "tvec": t_new.astype(np.float64),
+        "track_scale": scale,
+        "track_theta_rad": theta,
+        "track_tx_px": tx,
+        "track_ty_px": ty,
+        "track_inlier_ratio": inl_ratio,
+        "track_points": int(dst.shape[0]),
+    }
+    return pose, nxt_track
+
+
+def _snap_pose_xy_to_mask_com(
+    state: dict,
+    cx: int,
+    cy: int,
+    K: np.ndarray,
+    alpha: float = 0.85,
+) -> None:
+    """
+    Keep projected object origin attached to the mask COM.
+    Adjusts only X/Y translation in camera coordinates.
+    """
+    rvec = state.get("rvec_raw")
+    tvec = state.get("tvec_raw")
+    if rvec is None or tvec is None:
+        return
+    tv = np.asarray(tvec, dtype=np.float64).reshape(3, 1).copy()
+    rv = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    z = max(0.04, float(tv[2, 0]))
+    o_proj, _ = cv2.projectPoints(
+        np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
+        rv,
+        tv,
+        K,
+        np.zeros((5, 1), dtype=np.float64),
+    )
+    ox, oy = o_proj.reshape(-1, 2)[0]
+    dx = float(cx) - float(ox)
+    dy = float(cy) - float(oy)
+    a = float(np.clip(alpha, 0.0, 1.0))
+    tv[0, 0] += a * (dx / fx) * z
+    tv[1, 0] += a * (dy / fy) * z
+    state["tvec_raw"] = tv
+    # Keep filtered pose consistent too; smoother can still refine afterward.
+    state["tvec"] = tv.copy()
+
+
 def _fast_pose_update_local(
     est: NativeAxisMesh,
     mask_bool: np.ndarray,
@@ -631,6 +910,7 @@ def _fast_pose_update_local(
     rot_step_deg: float = 2.0,
     trans_step_xy: float = 0.003,
     trans_step_z: float = 0.008,
+    dt_ctx: dict | None = None,
 ) -> dict:
     """
     Fast local search around previous pose.
@@ -646,11 +926,11 @@ def _fast_pose_update_local(
     rv0 = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
     tv0 = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
     s = _reg_sign_from_state(state)
-    verts_s = est.mesh_vertices * s.reshape(1, 3)
     verts_base = getattr(est, "sample_vertices_fast", est.mesh_vertices)
     verts_sample = np.asarray(verts_base, dtype=np.float64) * s.reshape(1, 3)
     fh, fw = mask_bool.shape[:2]
-    dt_ctx = _prepare_mask_dt(mask_bool)
+    if dt_ctx is None:
+        dt_ctx = _prepare_mask_dt(mask_bool)
 
     ys, xs = np.where(mask_bool)
     if ys.size > 0:
@@ -666,21 +946,18 @@ def _fast_pose_update_local(
         tv_base = tv0.copy()
 
     ang = float(np.deg2rad(max(0.2, rot_step_deg)))
+    # Coarse 5x5 local grid (was 7x7): keeps most of the benefit with ~half the evals.
     rot_deltas = [
         np.array([0.0, 0.0, 0.0], dtype=np.float64),
         np.array([ang, 0.0, 0.0], dtype=np.float64),
         np.array([-ang, 0.0, 0.0], dtype=np.float64),
         np.array([0.0, ang, 0.0], dtype=np.float64),
         np.array([0.0, -ang, 0.0], dtype=np.float64),
-        np.array([0.0, 0.0, ang], dtype=np.float64),
-        np.array([0.0, 0.0, -ang], dtype=np.float64),
     ]
     trans_deltas = [
         np.array([0.0, 0.0, 0.0], dtype=np.float64),
         np.array([trans_step_xy, 0.0, 0.0], dtype=np.float64),
         np.array([-trans_step_xy, 0.0, 0.0], dtype=np.float64),
-        np.array([0.0, trans_step_xy, 0.0], dtype=np.float64),
-        np.array([0.0, -trans_step_xy, 0.0], dtype=np.float64),
         np.array([0.0, 0.0, trans_step_z], dtype=np.float64),
         np.array([0.0, 0.0, -trans_step_z], dtype=np.float64),
     ]
@@ -1069,6 +1346,18 @@ def run(args: argparse.Namespace) -> None:
         f"Timing: initial_registration (containment scipy, seed frame, all objects) = "
         f"{t_reg_s:.3f} s"
     )
+    keypoint_tracks: dict[int, dict] = {}
+    base_poses: dict[int, dict] = {}
+    for oid, st in pose_states.items():
+        if st.get("rvec") is None or st.get("tvec") is None:
+            continue
+        base_poses[oid] = {
+            "rvec": np.asarray(st["rvec"], dtype=np.float64).reshape(3, 1).copy(),
+            "tvec": np.asarray(st["tvec"], dtype=np.float64).reshape(3, 1).copy(),
+        }
+        tr = _init_keypoint_track_state(seed_frame, seed_mask_bool.get(oid, np.zeros((fh, fw), dtype=bool)))
+        if tr is not None:
+            keypoint_tracks[oid] = tr
 
     writer = None
     if args.output:
@@ -1083,18 +1372,28 @@ def run(args: argparse.Namespace) -> None:
 
     align_win = "3D mesh ↔ 2D mask (alignment)"
     last_align_combo: np.ndarray | None = None
+    if not args.no_align_debug:
+        frozen_panels: list[np.ndarray] = []
+        for oid, st in pose_states.items():
+            est = meshes.get(oid)
+            mb = seed_mask_bool.get(oid)
+            if est is None or mb is None:
+                continue
+            p = _alignment_debug_panel(seed_frame, est, st, mb, K_cam, dist_cam, oid, 0)
+            if p is not None:
+                frozen_panels.append(p)
+        if frozen_panels:
+            last_align_combo = _layout_alignment_mosaic(frozen_panels, per_row=2)
     print(
-        "Speed: live_track.py is faster with stock settings because pose + SAM3D bootstrap "
-        "are commented out there (mask overlay + COM trails only), so no registration at all "
-        "and no fal work in the hot path. Here use --full-relock-every 8+, "
-        "--align-refresh-every 3, --no-align-debug, and/or a smaller "
-        "--max-trail to reduce CPU load."
+        "Pose alignment now runs only on the frozen seed frame. Live updates use keypoint "
+        "tracking to move the 3D object/axes without per-frame registration."
     )
     print("Live tracking + pose. Press q / ESC to quit.")
     fps_t0 = time.perf_counter()
     fps_frames = 0
-    stage_t = {"fast": 0.0, "full": 0.0}
-    stage_n = {"fast": 0, "full": 0}
+    stage_t = {"track": 0.0}
+    stage_n = {"track": 0}
+    prev_gray = cv2.cvtColor(seed_frame, cv2.COLOR_BGR2GRAY)
     try:
         with torch.autocast(device_type=ac_device, dtype=ac_dtype, enabled=ac_enabled):
             for fi, obj_ids, masks in predictor.propagate_in_video(
@@ -1111,12 +1410,7 @@ def run(args: argparse.Namespace) -> None:
 
                 vis = overlay_masks(frame, ids, masks, alpha=args.alpha)
                 masks_np = masks.detach().cpu().numpy()
-                reg_every = max(1, int(args.reg_every))
-                fast_every = max(1, int(args.fast_update_every))
-                full_relock_every = max(reg_every, int(args.full_relock_every))
-                align_stride = max(1, int(args.align_refresh_every))
-                build_align = (not args.no_align_debug) and (int(fi) % align_stride == 0)
-                align_panels: list[np.ndarray] = []
+                curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
                 for i in range(min(len(ids), masks_np.shape[0])):
                     oid = ids[i]
@@ -1139,51 +1433,48 @@ def run(args: argparse.Namespace) -> None:
                         est = meshes.get(oid)
                         if est is not None:
                             st0 = pose_states.get(oid, {})
-                            conf0 = float(st0.get("confidence", 0.0))
-                            low_frames = int(st0.get("low_conf_frames", 0))
-                            last_relock = int(st0.get("last_relock_frame", 0))
-                            run_full = (
-                                st0.get("rvec") is None
-                                or (int(fi) - last_relock >= full_relock_every)
-                                or (conf0 < float(args.confidence_low) and low_frames >= int(args.lost_frames_trigger))
-                            )
-                            run_fast = (not run_full) and (int(fi) % fast_every == 0)
-
                             st = st0.copy()
-                            if run_full:
+                            tr = keypoint_tracks.get(oid)
+                            bp = base_poses.get(oid)
+                            if tr is not None and bp is not None:
                                 t0 = time.perf_counter()
-                                st = _register_rigid_containment(
-                                    est,
-                                    binm,
+                                pose_kp, tr_new = _update_pose_from_keypoint_track(
+                                    tr,
+                                    prev_gray,
+                                    curr_gray,
+                                    bp,
                                     K_cam,
-                                    dist_cam,
-                                    st,
+                                    mask_hint=binm,
+                                    prev_pose=st,
+                                    rot_smooth_w=float(args.track_rot_smooth_w),
+                                    trans_smooth_w=float(args.track_trans_smooth_w),
                                 )
-                                stage_t["full"] += time.perf_counter() - t0
-                                stage_n["full"] += 1
-                                st["rvec_raw"] = st.get("rvec")
-                                st["tvec_raw"] = st.get("tvec")
-                                st["last_relock_frame"] = int(fi)
-                                st["last_solver"] = "full"
-                            elif run_fast:
-                                t0 = time.perf_counter()
-                                st = _fast_pose_update_local(
-                                    est,
-                                    binm,
-                                    K_cam,
-                                    dist_cam,
-                                    st,
-                                    rot_step_deg=float(args.fast_rot_step_deg),
-                                    trans_step_xy=float(args.fast_trans_step_xy),
-                                    trans_step_z=float(args.fast_trans_step_z),
-                                )
-                                stage_t["fast"] += time.perf_counter() - t0
-                                stage_n["fast"] += 1
-                                st["last_solver"] = "fast"
+                                stage_t["track"] += time.perf_counter() - t0
+                                stage_n["track"] += 1
+                                keypoint_tracks[oid] = tr_new
+                                if pose_kp is not None:
+                                    st["rvec_raw"] = pose_kp["rvec_raw"]
+                                    st["tvec_raw"] = pose_kp["tvec_raw"]
+                                    st["last_solver"] = "keypoint_track"
+                                    st["track_inlier_ratio"] = float(pose_kp.get("track_inlier_ratio", 0.0))
+                                    st["track_points"] = int(pose_kp.get("track_points", 0))
+                                    _snap_pose_xy_to_mask_com(st, cx, cy, K_cam, alpha=0.90)
+                                    rv_f, tv_f = _apply_kalman_pose_filter(
+                                        st,
+                                        np.asarray(st["rvec_raw"], dtype=np.float64).reshape(3, 1),
+                                        np.asarray(st["tvec_raw"], dtype=np.float64).reshape(3, 1),
+                                        float(args.kalman_process_var),
+                                        float(args.kalman_meas_var),
+                                    )
+                                    st["rvec"] = rv_f
+                                    st["tvec"] = tv_f
+                                else:
+                                    st["last_solver"] = "keypoint_track_lost"
                             else:
-                                st["last_solver"] = "hold"
+                                st["last_solver"] = "no_keypoints"
 
-                            m = _pose_alignment_metrics(est, binm, K_cam, dist_cam, st)
+                            dt_ctx = _prepare_mask_dt(binm)
+                            m = _pose_alignment_metrics(est, binm, K_cam, dist_cam, st, dt_ctx=dt_ctx)
                             st["iou"] = m["iou"]
                             st["dice"] = m["dice"]
                             st["centroid_px"] = m["centroid_px"]
@@ -1207,19 +1498,6 @@ def run(args: argparse.Namespace) -> None:
                             _draw_native_axes_fixed_pixel(
                                 vis, pose_states[oid], K_cam, dist_cam, AXIS_LENGTH_PX
                             )
-                            if build_align:
-                                panel = _alignment_debug_panel(
-                                    frame,
-                                    est,
-                                    pose_states[oid],
-                                    binm,
-                                    K_cam,
-                                    dist_cam,
-                                    oid,
-                                    fi,
-                                )
-                                if panel is not None:
-                                    align_panels.append(panel)
                             _draw_com_pose_readout(
                                 vis, oid, cx, cy, pose_states.get(oid)
                             )
@@ -1238,10 +1516,6 @@ def run(args: argparse.Namespace) -> None:
 
                 cv2.imshow("EdgeTAM + 6DoF pose", vis)
                 if not args.no_align_debug:
-                    if align_panels:
-                        mosaic = _layout_alignment_mosaic(align_panels, per_row=2)
-                        if mosaic is not None:
-                            last_align_combo = mosaic
                     if last_align_combo is not None:
                         cv2.imshow(align_win, last_align_combo)
                 if writer is not None:
@@ -1249,8 +1523,13 @@ def run(args: argparse.Namespace) -> None:
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
+                    print("Exiting live loop: q / ESC pressed.")
                     break
                 if stop_flag.is_set():
+                    print(
+                        "Exiting live loop: camera capture stalled (no new frames). "
+                        "Try another --camera index, a different USB port, or close other apps using the camera."
+                    )
                     break
 
                 fps_frames += 1
@@ -1258,17 +1537,16 @@ def run(args: argparse.Namespace) -> None:
                 dt_fps = now - fps_t0
                 if dt_fps >= 1.0:
                     fps_now = fps_frames / dt_fps
-                    full_ms = (1000.0 * stage_t["full"] / max(1, stage_n["full"]))
-                    fast_ms = (1000.0 * stage_t["fast"] / max(1, stage_n["fast"]))
+                    trk_ms = (1000.0 * stage_t["track"] / max(1, stage_n["track"]))
                     print(
                         f"FPS (live loop): {fps_now:.2f} | "
-                        f"fast={stage_n['fast']} ({fast_ms:.2f}ms avg) | "
-                        f"full={stage_n['full']} ({full_ms:.2f}ms avg)"
+                        f"track={stage_n['track']} ({trk_ms:.2f}ms avg)"
                     )
                     fps_t0 = now
                     fps_frames = 0
-                    stage_t = {"fast": 0.0, "full": 0.0}
-                    stage_n = {"fast": 0, "full": 0}
+                    stage_t = {"track": 0.0}
+                    stage_n = {"track": 0}
+                prev_gray = curr_gray
     finally:
         stop_flag.set()
         cap.release()
@@ -1312,7 +1590,7 @@ def main() -> None:
     parser.add_argument(
         "--full-relock-every",
         type=int,
-        default=8,
+        default=12,
         help="Run full scipy containment relock every N frames.",
     )
     parser.add_argument(
@@ -1364,9 +1642,33 @@ def main() -> None:
         help="Fast local search step for translation Z (camera units).",
     )
     parser.add_argument(
+        "--kalman-process-var",
+        type=float,
+        default=KALMAN_PROCESS_VAR,
+        help="Kalman process variance Q for 6DoF smoothing.",
+    )
+    parser.add_argument(
+        "--kalman-meas-var",
+        type=float,
+        default=KALMAN_MEAS_VAR,
+        help="Kalman measurement variance R for 6DoF smoothing.",
+    )
+    parser.add_argument(
+        "--track-rot-smooth-w",
+        type=float,
+        default=TRACK_ROT_SMOOTH_W,
+        help="Continuity penalty weight for rotation jumps in keypoint tracking.",
+    )
+    parser.add_argument(
+        "--track-trans-smooth-w",
+        type=float,
+        default=TRACK_TRANS_SMOOTH_W,
+        help="Continuity penalty weight for translation jumps in keypoint tracking.",
+    )
+    parser.add_argument(
         "--align-refresh-every",
         type=int,
-        default=1,
+        default=5,
         help="Rebuild alignment debug mosaic every N frames (1=every frame).",
     )
     parser.add_argument(
