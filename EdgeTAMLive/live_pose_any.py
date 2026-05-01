@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Live 6DoF pose for arbitrary objects: EdgeTAM seeds → fal SAM3D GLBs → containment rigid
-registration → native GLB axes overlay (60 px arrows) + COM trails.
+Live 6DoF pose for arbitrary objects: EdgeTAM seeds → fal SAM3D GLBs → PCA / PnP +
+2D contour ICP registration → native GLB axes overlay (60 px arrows) + COM trails.
 
 Requires:
   - EdgeTAM checkpoint under EdgeTAM/checkpoints/edgetam.pt
-  - scipy, trimesh, fal-client
+  - scipy (cKDTree), trimesh, fal-client
   - export FAL_KEY="..."
 
 Usage (from repo root or EdgeTAMLive):
@@ -42,9 +42,9 @@ except Exception:
     trimesh = None
 
 try:
-    from scipy.optimize import minimize  # type: ignore
+    from scipy.spatial import cKDTree  # type: ignore
 except Exception:
-    minimize = None
+    cKDTree = None  # type: ignore
 
 # Reuse EdgeTAM live pipeline pieces from sibling module.
 from live_track_copy import (
@@ -52,32 +52,23 @@ from live_track_copy import (
     LiveFrameProvider,
     TARGET_SIZE,
     _autocast_config,
-    _bits_from_reg_sign,
     _draw_pose_hud,
     _draw_solid_alignment,
     _estimate_intrinsics_from_cap,
     _load_predictor,
-    _mask_ellipse_params,
-    _mask_image_plane_axis_unit_cam,
     _mask_iou_dice,
     _mask_to_2d_bool,
-    _reg_sign_bits_from_index,
+    _order_corners_clockwise,
     _reg_sign_from_state,
-    _rotmat_align_unit_vectors,
-    _unit_pca_axis_signed,
+    _sample_mask_contour,
+    _sample_quad_perimeter,
     choose_device,
     detect_orbbec_camera,
     get_mask_contour,
     overlay_masks,
     pick_points_live,
     point_color,
-    preprocess,
 )
-
-# Match live_track_copy registration hyperparameters.
-_REG_NEIGHBORHOOD_W = 0.02
-_REG_MAXITER_FIRST = 40
-_REG_MAXITER_TRACK = 22
 
 AXIS_LENGTH_PX = 60
 # Match live_track.py default COM trail cap.
@@ -188,6 +179,27 @@ class NativeAxisMesh:
         mn = verts.min(axis=0)
         mx = verts.max(axis=0)
         self.extents = (mx - mn).astype(np.float64)
+
+        # PCA principal plane (same construction as tests/edgetam_clicks_to_sam3d_glb.build_model_quad_from_mesh).
+        cen = verts.mean(axis=0)
+        v = verts - cen
+        cov = (v.T @ v) / max(len(v), 1)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        order = np.argsort(eigvals)[::-1]
+        self.R_pca = eigvecs[:, order].astype(np.float64)
+        aligned = v @ self.R_pca
+        hP = (aligned[:, 0].max() - aligned[:, 0].min()) / 2.0
+        hS = (aligned[:, 1].max() - aligned[:, 1].min()) / 2.0
+        self.centroid = cen.astype(np.float64)
+        self.model_pts = np.array(
+            [[-hP, -hS, 0.0], [hP, -hS, 0.0], [hP, hS, 0.0], [-hP, hS, 0.0]],
+            dtype=np.float64,
+        )
+        _perim_m = 64
+        perim_xy = _sample_quad_perimeter(self.model_pts[:, :2], _perim_m)
+        self.perim_samples_3d = np.column_stack(
+            [perim_xy[:, 0], perim_xy[:, 1], np.zeros(_perim_m, dtype=np.float64)]
+        )
 
 
 def _mesh_silhouette_bool(
@@ -318,7 +330,247 @@ def _containment_from_pose(
     return _containment_metric(mask_bool, sil)
 
 
-def _p0_native_extent_seed(
+def _compose_native_pose_from_pca(
+    rvec_pca: np.ndarray,
+    tvec_pca: np.ndarray,
+    R_pca: np.ndarray,
+    centroid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map PCA-plane solvePnP pose to native GLB frame: R_full = R_cam_from_pca @ R_pca.T."""
+    R_pnp, _ = cv2.Rodrigues(np.asarray(rvec_pca, dtype=np.float64).reshape(3, 1))
+    R_ax = np.asarray(R_pca, dtype=np.float64).reshape(3, 3)
+    c = np.asarray(centroid, dtype=np.float64).reshape(3)
+    R_full = R_pnp @ R_ax.T
+    t_full = np.asarray(tvec_pca, dtype=np.float64).reshape(3, 1) - R_full @ c.reshape(3, 1)
+    rvec_full, _ = cv2.Rodrigues(R_full)
+    return rvec_full, t_full
+
+
+def _mean_reprojection_error(
+    obj_pts: np.ndarray,
+    img_pts: np.ndarray,
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+) -> float:
+    proj, _ = cv2.projectPoints(
+        np.asarray(obj_pts, dtype=np.float64),
+        np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+        np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+        K,
+        dist,
+    )
+    d = np.linalg.norm(proj.reshape(-1, 2) - np.asarray(img_pts, dtype=np.float64), axis=1)
+    return float(np.mean(d))
+
+
+def _nn_query_bf(query: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    q = np.asarray(query, dtype=np.float64)
+    r = np.asarray(ref, dtype=np.float64)
+    out = np.empty(len(q), dtype=np.int64)
+    for i in range(len(q)):
+        out[i] = int(np.argmin(np.sum((r - q[i]) ** 2, axis=1)))
+    return out
+
+
+def _icp_refine_pnp(
+    est: NativeAxisMesh,
+    mask_contour: np.ndarray,
+    rvec_pca: np.ndarray,
+    tvec_pca: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    n_contour: int,
+    icp_iters: int,
+    fh: int,
+    fw: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Silhouette perimeter samples → NN snap to mask contour → solvePnP (PCA object frame)."""
+    rvec = np.asarray(rvec_pca, dtype=np.float64).reshape(3, 1).copy()
+    tvec = np.asarray(tvec_pca, dtype=np.float64).reshape(3, 1).copy()
+    mask_contour = np.asarray(mask_contour, dtype=np.float64)
+
+    if icp_iters <= 0:
+        return rvec, tvec
+
+    tree = cKDTree(mask_contour) if cKDTree is not None else None
+
+    for _ in range(int(icp_iters)):
+        r_prev = rvec.copy()
+        t_prev = tvec.copy()
+        R, _ = cv2.Rodrigues(rvec)
+        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+
+        r_full, t_full = _compose_native_pose_from_pca(rvec, tvec, est.R_pca, est.centroid)
+        sil_u8 = _mesh_silhouette_u8(
+            est.mesh_vertices, est.mesh_faces, r_full, t_full, K, dist, fh, fw
+        )
+        sil_contour = _sample_mask_contour(sil_u8, int(n_contour))
+        if sil_contour is None or sil_contour.shape[0] < 4:
+            break
+
+        n = R[:, 2].astype(np.float64)
+        nt = float(n @ tvec.reshape(3))
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        u, v = sil_contour[:, 0], sil_contour[:, 1]
+        rx = (u - cx) / max(fx, 1e-9)
+        ry = (v - cy) / max(fy, 1e-9)
+        rays = np.column_stack([rx, ry, np.ones(len(u), dtype=np.float64)])
+        denom = rays @ n
+        good = np.abs(denom) > 1e-9
+        if int(good.sum()) < 4:
+            break
+        lam = np.zeros(len(u), dtype=np.float64)
+        lam[good] = nt / denom[good]
+        good &= lam > 1e-6
+        if int(good.sum()) < 4:
+            break
+
+        P_cam = rays[good] * lam[good, np.newaxis]
+        P_obj = (R.T @ (P_cam.T - tvec.reshape(3, 1))).T
+
+        sil_g = sil_contour[good]
+        if tree is not None:
+            _, idx = tree.query(sil_g, k=1)
+            tgt = mask_contour[np.asarray(idx, dtype=np.int64)]
+        else:
+            idx = _nn_query_bf(sil_g, mask_contour)
+            tgt = mask_contour[idx]
+
+        ok, r_new, t_new = cv2.solvePnP(
+            P_obj.astype(np.float64),
+            tgt.astype(np.float64),
+            K,
+            dist,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not ok:
+            break
+        rvec = r_new.reshape(3, 1)
+        tvec = t_new.reshape(3, 1)
+
+        dr = float(np.linalg.norm(rvec - r_prev))
+        dt = float(np.linalg.norm(tvec - t_prev))
+        if dr < 1e-4 and dt < 1e-5:
+            break
+
+    return rvec, tvec
+
+
+def _register_pnp_icp(
+    est: NativeAxisMesh,
+    mask_bool: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+    state: dict | None,
+    n_contour: int = 128,
+    icp_iters: int = 3,
+) -> dict:
+    """PCA quad + mask contour PnP with shift/reverse search, then 2D contour ICP refine."""
+    if state is None:
+        state = {}
+    if not np.any(mask_bool):
+        return state
+
+    fh, fw = mask_bool.shape[:2]
+    mask_u8 = mask_bool.astype(np.uint8) * 255
+    mask_contour = _sample_mask_contour(mask_u8, int(n_contour))
+
+    ys, xs = np.where(mask_bool)
+    if len(xs) < 8:
+        return state
+
+    pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+    rect = cv2.minAreaRect(pts.reshape(-1, 1, 2))
+    img_corners = _order_corners_clockwise(cv2.boxPoints(rect).astype(np.float64))
+
+    if mask_contour is None:
+        mask_contour = _sample_quad_perimeter(img_corners, int(n_contour))
+
+    model_dense0 = _sample_quad_perimeter(est.model_pts[:, :2], int(n_contour))
+    step = max(len(model_dense0) // 4, 1)
+
+    best_score = float("inf")
+    best_rvec: np.ndarray | None = None
+    best_tvec: np.ndarray | None = None
+
+    for order_mode in ("forward", "reverse"):
+        contour_use = mask_contour if order_mode == "forward" else mask_contour[::-1].copy()
+        for shift in range(4):
+            model_dense_xy = np.roll(model_dense0, shift * step, axis=0)
+            model_dense = np.column_stack(
+                [model_dense_xy[:, 0], model_dense_xy[:, 1], np.zeros(len(model_dense_xy))]
+            )
+            used_ippe = False
+            obj_corners = np.roll(est.model_pts, shift, axis=0)
+
+            ok, rvec, tvec = cv2.solvePnP(
+                model_dense.astype(np.float64),
+                contour_use.astype(np.float64),
+                K,
+                dist,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if not ok:
+                used_ippe = True
+                ok, rvec, tvec = cv2.solvePnP(
+                    obj_corners.astype(np.float64),
+                    img_corners.astype(np.float64),
+                    K,
+                    dist,
+                    flags=cv2.SOLVEPNP_IPPE,
+                )
+                if not ok:
+                    continue
+
+            if used_ippe:
+                reproj = _mean_reprojection_error(obj_corners, img_corners, rvec, tvec, K, dist)
+            else:
+                reproj = _mean_reprojection_error(model_dense, contour_use, rvec, tvec, K, dist)
+
+            r_full, t_full = _compose_native_pose_from_pca(rvec, tvec, est.R_pca, est.centroid)
+            cont = _containment_from_pose(
+                mask_bool, est.mesh_vertices, est.mesh_faces, r_full, t_full, K, dist
+            )
+            cclip = float(np.clip(cont, 0.0, 1.0))
+            score = reproj + 50.0 * (1.0 - cclip)
+            if score < best_score:
+                best_score = score
+                best_rvec = np.asarray(rvec, dtype=np.float64).copy()
+                best_tvec = np.asarray(tvec, dtype=np.float64).copy()
+
+    if best_rvec is None or best_tvec is None:
+        return state
+
+    rvec_pca, tvec_pca = _icp_refine_pnp(
+        est,
+        mask_contour,
+        best_rvec,
+        best_tvec,
+        K,
+        dist,
+        int(n_contour),
+        int(icp_iters),
+        fh,
+        fw,
+    )
+    r_full, t_full = _compose_native_pose_from_pca(rvec_pca, tvec_pca, est.R_pca, est.centroid)
+
+    state["reg_sign"] = np.ones(3, dtype=np.float64)
+    state["rvec"] = r_full
+    state["tvec"] = t_full
+    state["containment"] = float(
+        _containment_from_pose(mask_bool, est.mesh_vertices, est.mesh_faces, r_full, t_full, K, dist)
+    )
+    return state
+
+
+# =============================================================================
+# LEGACY: slow Nelder–Mead scipy path; replaced by _register_pnp_icp (reference only).
+# =============================================================================
+def _LEGACY_p0_native_extent_seed(
     est: NativeAxisMesh,
     mask_bool: np.ndarray,
     K: np.ndarray,
@@ -327,6 +579,13 @@ def _p0_native_extent_seed(
     t_init: np.ndarray,
     z0: float,
 ) -> np.ndarray | None:
+    from live_track_copy import (
+        _mask_ellipse_params,
+        _mask_image_plane_axis_unit_cam,
+        _rotmat_align_unit_vectors,
+        _unit_pca_axis_signed,
+    )
+
     ell = _mask_ellipse_params(mask_bool)
     if ell is None:
         return None
@@ -367,20 +626,28 @@ def _p0_native_extent_seed(
     return np.concatenate([r_final.reshape(3), tv.reshape(3)]).astype(np.float64)
 
 
-def _register_rigid_containment(
+def _LEGACY_register_rigid_containment(
     est: NativeAxisMesh,
     mask_bool: np.ndarray,
     K: np.ndarray,
     dist: np.ndarray,
     state: dict | None,
 ) -> dict:
-    """Rigid SE(3): maximize containment(mask ⊂ silhouette)."""
+    """LEGACY: rigid SE(3) via scipy.optimize.minimize (Nelder–Mead)."""
+    try:
+        from scipy.optimize import minimize as _minimize  # type: ignore
+    except Exception:
+        _minimize = None
+
+    from live_track_copy import _bits_from_reg_sign, _reg_sign_bits_from_index
+
+    _REG_NEIGHBORHOOD_W = 0.02
+    _REG_MAXITER_FIRST = 40
+    _REG_MAXITER_TRACK = 22
+
     if state is None:
         state = {}
-    if minimize is None or not np.any(mask_bool):
-        if minimize is None and not getattr(_register_rigid_containment, "_warned", False):
-            print("scipy not installed; install scipy for rigid mesh–mask registration.")
-            setattr(_register_rigid_containment, "_warned", True)
+    if _minimize is None or not np.any(mask_bool):
         return state
 
     ys, xs = np.where(mask_bool)
@@ -418,7 +685,7 @@ def _register_rigid_containment(
         p0 = p_base.astype(np.float64).copy()
         if prev_r is None:
             p0[3:] = t_init
-            seed = _p0_native_extent_seed(est, mask_bool, K, dist, s, t_init, Z0)
+            seed = _LEGACY_p0_native_extent_seed(est, mask_bool, K, dist, s, t_init, Z0)
             if seed is not None:
                 p0 = seed.astype(np.float64)
 
@@ -430,7 +697,7 @@ def _register_rigid_containment(
             return float(-sc + reg)
 
         try:
-            res = minimize(
+            res = _minimize(
                 _obj,
                 p0,
                 method="Nelder-Mead",
@@ -794,17 +1061,23 @@ def run(args: argparse.Namespace) -> None:
     )
 
     pose_states: dict[int, dict] = {}
-    print("Initial containment registration on seed masks …")
+    print("Initial PCA + PnP + contour-ICP registration on seed masks …")
     t_reg0 = time.perf_counter()
     for oid, mb in seed_mask_bool.items():
         if oid not in meshes:
             continue
-        pose_states[oid] = _register_rigid_containment(
-            meshes[oid], mb, K_cam, dist_cam, None
+        pose_states[oid] = _register_pnp_icp(
+            meshes[oid],
+            mb,
+            K_cam,
+            dist_cam,
+            None,
+            n_contour=int(args.contour_samples),
+            icp_iters=int(args.icp_iters),
         )
     t_reg_s = time.perf_counter() - t_reg0
     print(
-        f"Timing: initial_registration (containment scipy, seed frame, all objects) = "
+        f"Timing: initial_registration (PnP + contour ICP, seed frame, all objects) = "
         f"{t_reg_s:.3f} s"
     )
 
@@ -823,7 +1096,7 @@ def run(args: argparse.Namespace) -> None:
     last_align_combo: np.ndarray | None = None
     print(
         "Speed: live_track.py is faster with stock settings because pose + SAM3D bootstrap "
-        "are commented out there (mask overlay + COM trails only), so no per-frame scipy "
+        "are commented out there (mask overlay + COM trails only), so no per-frame pose "
         "registration, no second window, and no fal work on the hot path. Here use "
         "--reg-every 2+, --align-refresh-every 3, --no-align-debug, and/or a smaller "
         "--max-trail to reduce CPU load."
@@ -875,12 +1148,14 @@ def run(args: argparse.Namespace) -> None:
                             st0 = pose_states.get(oid, {})
                             run_reg = (int(fi) % reg_every == 0) or (st0.get("rvec") is None)
                             if run_reg:
-                                pose_states[oid] = _register_rigid_containment(
+                                pose_states[oid] = _register_pnp_icp(
                                     est,
                                     binm,
                                     K_cam,
                                     dist_cam,
                                     pose_states.get(oid),
+                                    n_contour=int(args.contour_samples),
+                                    icp_iters=int(args.icp_iters),
                                 )
                             _draw_native_axes_fixed_pixel(
                                 vis, pose_states[oid], K_cam, dist_cam, AXIS_LENGTH_PX
@@ -947,7 +1222,9 @@ def run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Live 6DoF pose: EdgeTAM + fal SAM3D + containment registration.")
+    parser = argparse.ArgumentParser(
+        description="Live 6DoF pose: EdgeTAM + fal SAM3D + PCA / PnP + contour ICP registration."
+    )
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--alpha", type=float, default=0.85, help="Mask overlay alpha.")
@@ -970,7 +1247,19 @@ def main() -> None:
         "--reg-every",
         type=int,
         default=1,
-        help="Run scipy containment registration every N frames (1=every frame).",
+        help="Run PCA + PnP + contour-ICP registration every N frames (1=every frame).",
+    )
+    parser.add_argument(
+        "--icp-iters",
+        type=int,
+        default=3,
+        help="Contour ICP refine iterations after initial PnP (0 disables ICP refine).",
+    )
+    parser.add_argument(
+        "--contour-samples",
+        type=int,
+        default=128,
+        help="Dense samples along mask contour (and model quad perimeter) for PnP / ICP.",
     )
     parser.add_argument(
         "--align-refresh-every",
