@@ -460,13 +460,11 @@ class KalmanScalar:
         z = float(z)
         if self.x is None:
             self.x = z; self.v = 0.0; self.P = np.eye(2, dtype=np.float64); return z
-        # Predict
         x_p = self.x + self.v
         v_p = self.v
         F = np.array([[1.0, 1.0], [0.0, 1.0]])
         Q = np.array([[self.q, 0.0], [0.0, self.q * 0.1]])
         P_p = F @ self.P @ F.T + Q
-        # Update
         S   = P_p[0, 0] + self.r
         K0  = P_p[0, 0] / S
         K1  = P_p[1, 0] / S
@@ -480,13 +478,9 @@ class KalmanScalar:
 def _apply_kalman_pose_filter(state, rv, tv, process_var, meas_var):
     """Track rotation as quaternion (with sign continuity) + translation."""
     q_new = _rvec_to_quat(rv)
-
-    # Flip quaternion sign to stay on the same hemisphere as the previous frame,
-    # which prevents sudden 180° axis flips while representing the same rotation.
     q_prev = state.get("_kf_quat_prev")
     if q_prev is not None and float(np.dot(q_new, q_prev)) < 0.0:
         q_new = -q_new
-    state["_kf_quat_prev"] = q_new.copy()
 
     filters = state.get("kalman_filters")
     if filters is None or len(filters) != 7:
@@ -494,14 +488,11 @@ def _apply_kalman_pose_filter(state, rv, tv, process_var, meas_var):
         state["kalman_filters"] = filters
 
     vec = np.concatenate([q_new, tv.reshape(3)]).astype(np.float64)
-    out = np.empty_like(vec)
-    for i in range(7):
-        out[i] = filters[i].filter(float(vec[i]))
+    out = np.array([filters[i].filter(float(vec[i])) for i in range(7)])
 
     q_filt = out[:4] / (np.linalg.norm(out[:4]) + 1e-12)
-    rv_out = _quat_to_rvec(q_filt).reshape(3, 1)
-    tv_out = out[4:].reshape(3, 1)
-    return rv_out, tv_out
+    state["_kf_quat_prev"] = q_filt.copy()
+    return _quat_to_rvec(q_filt).reshape(3, 1), out[4:].reshape(3, 1)
 
 # ---------------------------------------------------------------------------
 # MeshPoseEstimator  —  dense minAreaRect PnP  (from live_track.py)
