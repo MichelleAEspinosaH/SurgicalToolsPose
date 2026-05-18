@@ -53,8 +53,8 @@ _IMG_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 _IMG_STD  = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
 PNP_PER_EDGE       = 8
-KALMAN_PROCESS_VAR = 2e-4
-KALMAN_MEAS_VAR    = 4e-3
+KALMAN_PROCESS_VAR = 5e-5
+KALMAN_MEAS_VAR    = 1e-2
 PNP_ROT_SMOOTH_W   = 0.03
 PNP_TRANS_SMOOTH_W = 8.0
 PNP_SHIFT_PENALTY  = 0.75
@@ -409,37 +409,99 @@ def _rotation_delta_deg(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))))
 
 # ---------------------------------------------------------------------------
-# Kalman filter
+# Quaternion helpers  (prevent axis-flip ambiguity in rvec tracking)
+# ---------------------------------------------------------------------------
+
+def _rvec_to_quat(rvec: np.ndarray) -> np.ndarray:
+    """Rodrigues vector → unit quaternion [w, x, y, z]."""
+    R, _ = cv2.Rodrigues(rvec.reshape(3).astype(np.float64))
+    m = R
+    t = m[0, 0] + m[1, 1] + m[2, 2]
+    if t > 0:
+        s = 0.5 / np.sqrt(t + 1.0)
+        return np.array([0.25 / s, (m[2,1]-m[1,2])*s, (m[0,2]-m[2,0])*s, (m[1,0]-m[0,1])*s])
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[0,0] - m[1,1] - m[2,2])
+        return np.array([(m[2,1]-m[1,2])/s, 0.25*s, (m[0,1]+m[1,0])/s, (m[0,2]+m[2,0])/s])
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[1,1] - m[0,0] - m[2,2])
+        return np.array([(m[0,2]-m[2,0])/s, (m[0,1]+m[1,0])/s, 0.25*s, (m[1,2]+m[2,1])/s])
+    else:
+        s = 2.0 * np.sqrt(1.0 + m[2,2] - m[0,0] - m[1,1])
+        return np.array([(m[1,0]-m[0,1])/s, (m[0,2]+m[2,0])/s, (m[1,2]+m[2,1])/s, 0.25*s])
+
+
+def _quat_to_rvec(q: np.ndarray) -> np.ndarray:
+    """Unit quaternion [w, x, y, z] → Rodrigues vector."""
+    q = q / (np.linalg.norm(q) + 1e-12)
+    w, x, y, z = q
+    R = np.array([
+        [1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
+        [  2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x)],
+        [  2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)],
+    ], dtype=np.float64)
+    rvec, _ = cv2.Rodrigues(R)
+    return rvec.reshape(3)
+
+# ---------------------------------------------------------------------------
+# Kalman filter  (constant-velocity model per scalar)
 # ---------------------------------------------------------------------------
 
 class KalmanScalar:
+    """1-D constant-velocity Kalman filter. State = [position, velocity]."""
     def __init__(self, process_var: float, meas_var: float):
         self.q = max(float(process_var), 1e-12)
         self.r = max(float(meas_var),    1e-12)
         self.x: float | None = None
-        self.p: float = 1.0
+        self.v: float = 0.0
+        self.P = np.eye(2, dtype=np.float64)
 
     def filter(self, z: float) -> float:
         z = float(z)
         if self.x is None:
-            self.x = z; self.p = 1.0; return z
-        self.p += self.q
-        k = self.p / (self.p + self.r)
-        self.x = self.x + k * (z - self.x)
-        self.p = (1.0 - k) * self.p
+            self.x = z; self.v = 0.0; self.P = np.eye(2, dtype=np.float64); return z
+        # Predict
+        x_p = self.x + self.v
+        v_p = self.v
+        F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        Q = np.array([[self.q, 0.0], [0.0, self.q * 0.1]])
+        P_p = F @ self.P @ F.T + Q
+        # Update
+        S   = P_p[0, 0] + self.r
+        K0  = P_p[0, 0] / S
+        K1  = P_p[1, 0] / S
+        inn = z - x_p
+        self.x = x_p + K0 * inn
+        self.v = v_p + K1 * inn
+        self.P = (np.eye(2) - np.outer([K0, K1], [1.0, 0.0])) @ P_p
         return self.x
 
 
 def _apply_kalman_pose_filter(state, rv, tv, process_var, meas_var):
+    """Track rotation as quaternion (with sign continuity) + translation."""
+    q_new = _rvec_to_quat(rv)
+
+    # Flip quaternion sign to stay on the same hemisphere as the previous frame,
+    # which prevents sudden 180° axis flips while representing the same rotation.
+    q_prev = state.get("_kf_quat_prev")
+    if q_prev is not None and float(np.dot(q_new, q_prev)) < 0.0:
+        q_new = -q_new
+    state["_kf_quat_prev"] = q_new.copy()
+
     filters = state.get("kalman_filters")
-    if filters is None or len(filters) != 6:
-        filters = [KalmanScalar(process_var, meas_var) for _ in range(6)]
+    if filters is None or len(filters) != 7:
+        filters = [KalmanScalar(process_var, meas_var) for _ in range(7)]
         state["kalman_filters"] = filters
-    vec = np.concatenate([rv.reshape(3), tv.reshape(3)]).astype(np.float64)
+
+    vec = np.concatenate([q_new, tv.reshape(3)]).astype(np.float64)
     out = np.empty_like(vec)
-    for i in range(6):
+    for i in range(7):
         out[i] = filters[i].filter(float(vec[i]))
-    return out[:3].reshape(3, 1), out[3:].reshape(3, 1)
+
+    q_filt = out[:4] / (np.linalg.norm(out[:4]) + 1e-12)
+    rv_out = _quat_to_rvec(q_filt).reshape(3, 1)
+    tv_out = out[4:].reshape(3, 1)
+    return rv_out, tv_out
 
 # ---------------------------------------------------------------------------
 # MeshPoseEstimator  —  dense minAreaRect PnP  (from live_track.py)
@@ -502,9 +564,10 @@ class MeshPoseEstimator:
         return best_rv, best_tv, best_err
 
     def _pnp_best_dense(self, model_corners4, img_corners4, K, dist,
-                        prev_rvec=None, prev_tvec=None, prev_shift=None):
+                        prev_rvec=None, prev_tvec=None, prev_shift=None,
+                        img_pts_n=None):
         n        = self._pnp_n
-        img_n    = _sample_quad_perimeter(img_corners4.astype(np.float64), n)
+        img_n    = img_pts_n if img_pts_n is not None else _sample_quad_perimeter(img_corners4.astype(np.float64), n)
         model_n0 = _sample_quad_perimeter(model_corners4.astype(np.float64), n)
         step     = n // 4
         best_rv, best_tv, best_err, best_shift = None, None, np.inf, None
@@ -543,21 +606,29 @@ class MeshPoseEstimator:
         if not np.any(mask_bool):
             return state
 
-        clean = cv2.erode(mask_bool.astype(np.uint8) * 255, np.ones((3, 3), np.uint8)) > 0
-        ys, xs = np.where(clean)
-        if len(xs) < 20:
-            return state
+        # # Step 1: Erosion — commented out
+        # clean = cv2.erode(mask_bool.astype(np.uint8) * 255, np.ones((3, 3), np.uint8)) > 0
+        # ys, xs = np.where(clean)
+        # if len(xs) < 20:
+        #     return state
 
-        p32     = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
-        rect    = cv2.minAreaRect(p32.reshape(-1, 1, 2))
-        img_corners = _order_corners_clockwise(cv2.boxPoints(rect).astype(np.float64))
+        # # Step 2: minAreaRect — commented out
+        # p32     = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+        # rect    = cv2.minAreaRect(p32.reshape(-1, 1, 2))
+        # img_corners = _order_corners_clockwise(cv2.boxPoints(rect).astype(np.float64))
+
+        mask_u8 = mask_bool.astype(np.uint8) * 255
+        img_n = _sample_mask_contour(mask_u8, self._pnp_n)
+        if img_n is None:
+            return state
 
         if "reg_sign" not in state:
             best_key = (-1.0, np.inf)
             best_rv, best_tv, best_s, best_shift = None, None, None, None
             for bits in range(8):
                 s = np.array([-1.0 if (bits >> i) & 1 else 1.0 for i in range(3)], dtype=np.float64)
-                rv, tv, err, shift = self._pnp_best_dense(self.model_pts * s, img_corners, K, dist)
+                rv, tv, err, shift = self._pnp_best_dense(self.model_pts * s, None, K, dist,
+                                                          img_pts_n=img_n)
                 if rv is None:
                     continue
                 iou = _mesh_projection_iou(mask_bool, self.mesh_vertices * s,
@@ -576,9 +647,10 @@ class MeshPoseEstimator:
             _rv = state.get("rvec_raw"); prev_rv = _rv if _rv is not None else state.get("rvec")
             _tv = state.get("tvec_raw"); prev_tv = _tv if _tv is not None else state.get("tvec")
             rv, tv, _, shift = self._pnp_best_dense(
-                self.model_pts * s, img_corners, K, dist,
+                self.model_pts * s, None, K, dist,
                 prev_rvec=prev_rv, prev_tvec=prev_tv,
                 prev_shift=state.get("pnp_shift"),
+                img_pts_n=img_n,
             )
             if rv is None:
                 return state
@@ -607,13 +679,23 @@ def _draw_pose_axes(vis, state, K, dist, axis_pts, obj_id) -> None:
     pts2d = proj.reshape(-1, 2)
     fh, fw = vis.shape[:2]
 
+    MAX_ARROW_PX = 40.0
+
     def clip_pt(p):
         return (int(np.clip(p[0], 0, fw - 1)), int(np.clip(p[1], 0, fh - 1)))
 
-    origin = clip_pt(pts2d[0])
-    x_tip  = clip_pt(pts2d[1])
-    y_tip  = clip_pt(pts2d[2])
-    z_tip  = clip_pt(pts2d[3])
+    def cap(o_f, t_f):
+        v = t_f - o_f
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            return o_f
+        return o_f + v * (MAX_ARROW_PX / n) if n > MAX_ARROW_PX else t_f
+
+    o_f    = pts2d[0].astype(np.float64)
+    origin = clip_pt(o_f)
+    x_tip  = clip_pt(cap(o_f, pts2d[1].astype(np.float64)))
+    y_tip  = clip_pt(cap(o_f, pts2d[2].astype(np.float64)))
+    z_tip  = clip_pt(cap(o_f, pts2d[3].astype(np.float64)))
 
     cv2.arrowedLine(vis, origin, x_tip, (0,   0, 220), 2, tipLength=0.20, line_type=cv2.LINE_AA)
     cv2.arrowedLine(vis, origin, y_tip, (0, 200,   0), 2, tipLength=0.20, line_type=cv2.LINE_AA)
