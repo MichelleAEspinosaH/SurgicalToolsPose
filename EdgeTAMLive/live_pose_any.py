@@ -53,8 +53,8 @@ _IMG_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 _IMG_STD  = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
 PNP_PER_EDGE       = 8
-KALMAN_PROCESS_VAR = 5e-5
-KALMAN_MEAS_VAR    = 1e-2
+KALMAN_PROCESS_VAR = 5e-3
+KALMAN_MEAS_VAR    = 1e-3
 PNP_ROT_SMOOTH_W   = 0.03
 PNP_TRANS_SMOOTH_W = 8.0
 PNP_SHIFT_PENALTY  = 0.75
