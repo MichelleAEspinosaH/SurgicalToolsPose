@@ -3,7 +3,13 @@
 Older scripts, experiments, and sample assets from earlier development.
 **Not required** to run the current pipeline — see the root [README](../README.md) and [EdgeTAMLive/README.md](../EdgeTAMLive/README.md).
 
-The active entry point is `EdgeTAMLive/live_pose_any.py` (checkerboard calibration in **cm**, metric HUD/CSV in **cm**; SAM3D PnP internally in **mm**).
+The active entry point is `EdgeTAMLive/live_pose_any.py`:
+
+- Checkerboard calibration in **cm**
+- Metric HUD/CSV in **cm** (PnP internally in **mm**, ×0.1 for display)
+- Live video at **640×360**; pose log `posesN.csv` in cwd
+
+See [../README.md](../README.md#how-it-works) for the full pipeline diagram.
 
 ## Layout
 

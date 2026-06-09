@@ -31,6 +31,7 @@ curl -L -o EdgeTAMLive/EdgeTAM/checkpoints/edgetam.pt \
 # Checkerboard calibration (once)
 cd EdgeTAMLive
 python live_pose_any.py --calibrate-only --camera 0
+python live_pose_any.py --show-calibration   # verify RMS & board size
 
 # Live tracking
 export FAL_KEY="your-fal-api-key"
@@ -46,15 +47,16 @@ Pose translation is reported in **centimetres** when checkerboard calibration is
 1. [Prerequisites](#prerequisites)
 2. [Installation](#installation)
 3. [Download models & API keys](#download-models--api-keys)
-4. [Camera calibration](#camera-calibration)
-5. [Run live tracking](#run-live-tracking)
-6. [Controls & workflow](#controls--workflow)
-7. [Outputs](#outputs)
-8. [CLI reference](#cli-reference)
-9. [Repository layout](#repository-layout)
-10. [Local files (not in git)](#local-files-not-in-git)
-11. [Troubleshooting](#troubleshooting)
-12. [Links & references](#links--references)
+4. [How it works](#how-it-works)
+5. [Camera calibration](#camera-calibration)
+6. [Run live tracking](#run-live-tracking)
+7. [Controls & workflow](#controls--workflow)
+8. [Outputs](#outputs)
+9. [CLI reference](#cli-reference)
+10. [Repository layout](#repository-layout)
+11. [Local files (not in git)](#local-files-not-in-git)
+12. [Troubleshooting](#troubleshooting)
+13. [Links & references](#links--references)
 
 ---
 
@@ -174,6 +176,37 @@ export FAL_KEY="your-fal-api-key-here"
 | Pricing (~$0.02 / object) | https://fal.ai/pricing |
 
 Default model ID: `fal-ai/sam-3/3d-objects` (override with `--fal-model`).
+
+---
+
+## How it works
+
+End-to-end flow from camera frame to metric 6DoF pose:
+
+```mermaid
+flowchart LR
+  A[Live camera] --> B[EdgeTAM seeds + masks]
+  B --> C[Confirm masks]
+  C --> D[fal SAM3D GLB per ID]
+  D --> E[Mesh → cm + PnP register]
+  E --> F[Per-frame dense PnP]
+  F --> G[Kalman smooth]
+  G --> H[HUD + CSV in cm]
+```
+
+| Step | Component | What happens |
+|------|-----------|--------------|
+| 1 | **EdgeTAM** | You click seed points; masks are tracked on every frame |
+| 2 | **fal SAM3D** | RGB + mask → GLB mesh (longest axis normalized to **1 m**) |
+| 3 | **Mesh prep** | GLB converted **m → cm** (×100); optional `_repaired.glb` cache |
+| 4 | **Registration** | Seed-mask PnP + pinhole depth fit sets `registration_depth_scale` |
+| 5 | **Tracking** | `MeshPoseEstimator`: minAreaRect perimeter → iterative PnP each frame |
+| 6 | **Smoothing** | Independent Kalman filters on rotation and translation |
+| 7 | **Metric output** | PnP `tvec` is in **mm**; HUD/CSV apply ×0.1 for **cm** |
+
+**Video processing:** all frames are resized to **640×360** before EdgeTAM and PnP. Use the same camera index, zoom, and focus for calibration and tracking.
+
+**Pinhole depth fit (registration):** on the seed frame, depth scale is chosen so apparent mesh width matches mask size: `Z ≈ f × W_mesh / L_px`, then applied to convert mm PnP depth to cm for display.
 
 ---
 
@@ -326,23 +359,47 @@ python live_pose_any.py --calibrate-checkerboard --camera 0
 
 ## Controls & workflow
 
+### Session flow
+
 ```
-1. Live video opens
+1. Live video opens (640×360)
 2. Click seed points per tool → Enter
 3. EdgeTAM masks on frozen seed frame
-4. Confirm masks → Y / Enter
+4. Confirm masks → Y / Enter  (or R / N / ESC to abort)
 5. fal SAM3D builds GLB per object (parallel; status overlay per ID)
 6. Mesh registration + pinhole depth fit on seed mask
-7. Live tracking with pose axes + HUD (translation in cm)
+7. Live tracking with mask overlay, COM trails, pose axes + HUD (cm)
+8. Press Q / ESC to quit
 ```
 
-| Seed window | Action |
-|-------------|--------|
-| **Left click** | Add seed (first click freezes frame) |
+### Seed selection (`Select EdgeTAM points`)
+
+| Key / action | Effect |
+|--------------|--------|
+| **Left click** | Add seed point (first click freezes frame) |
 | **Backspace** | Remove last point |
-| **C** | Clear all / unfreeze |
-| **Enter** | Start tracking |
-| **Q** / **ESC** | Cancel / quit |
+| **C** | Clear all points / unfreeze |
+| **Enter** | Start EdgeTAM + continue pipeline |
+| **Q** / **ESC** | Cancel |
+
+### Mask confirmation (`Confirm seed masks`)
+
+| Key | Effect |
+|-----|--------|
+| **Enter** / **Y** | Accept masks → upload to fal SAM3D |
+| **R** / **N** / **ESC** | Abort session |
+
+### fal SAM3D progress overlay
+
+Shows per-ID status: `uploading mask…` → `SAM3D running…` → `downloading GLB…` → `done`. Press **Q** / **ESC** to interrupt waiting.
+
+### Live tracking (`EdgeTAM + 6DoF Pose`)
+
+| Key | Effect |
+|-----|--------|
+| **Q** / **ESC** | Stop tracking and save CSV / video |
+
+On-screen: coloured mask overlay, COM trail per object, RGB XYZ axes at tool centroid, HUD line `IDn  R(rx,ry,rz)deg  T(tx,ty,tz)cm`.
 
 ---
 
@@ -350,13 +407,25 @@ python live_pose_any.py --calibrate-checkerboard --camera 0
 
 | Output | Location | Description |
 |--------|----------|-------------|
-| Pose HUD | On-screen | `R(rx,ry,rz)deg  T(tx,ty,tz)cm` |
-| CSV log | `posesN.csv` (cwd) | `tx_cm`, `ty_cm`, `tz_cm` + Euler angles |
+| Pose HUD | On-screen | `R(rx,ry,rz)deg  T(tx,ty,tz)cm` per object ID |
+| CSV log | `posesN.csv` (cwd) | Auto-numbered; written under `EdgeTAMLive/` when run from there |
 | Seed frame | `sam3d_live_objects/seed_frame.png` | RGB sent to SAM3D |
 | Masks | `sam3d_live_objects/mask_<id>.png` | Per-object masks |
 | GLB meshes | `sam3d_live_objects/object_<id>.glb` | fal SAM3D models (1 m normalized axis) |
-| Repaired GLB cache | `sam3d_live_objects/object_<id>_repaired.glb` | Local mesh cache (delete if scale wrong) |
-| Video | `--output path.mp4` | Annotated recording |
+| Repaired GLB cache | `sam3d_live_objects/object_<id>_repaired.glb` | Hole-filled local cache (delete if scale wrong) |
+| Video | `--output path.mp4` | Annotated recording at 30 fps |
+
+### CSV columns
+
+Header (with checkerboard calibration):
+
+```
+frame_idx, time_s, object_id, rx_deg, ry_deg, rz_deg, tx_cm, ty_cm, tz_cm
+```
+
+- **Rotation:** Euler angles (degrees), ZYX convention
+- **Translation:** centimetres (converted from internal mm PnP)
+- Without calibration (and no `--surface-distance-cm`): columns are `tx`, `ty`, `tz` in arbitrary units
 
 ---
 
@@ -395,22 +464,32 @@ python live_pose_any.py [options]
 | `--no-orbbec-intrinsics` | off | Skip Orbbec SDK intrinsics |
 | `--no-half` | off | Disable FP16 inference |
 
+**Calibration-only / inspect (no camera tracking):**
+
+```bash
+python live_pose_any.py --calibrate-only --camera 0
+python live_pose_any.py --show-calibration
+python live_pose_any.py --show-calibration --calibration-out /path/to/camera_calibration.npz
+```
+
 ---
 
 ## Repository layout
 
 ```
 SurgicalToolsPose/
-├── README.md                        ← you are here
+├── README.md                        ← full documentation (you are here)
 ├── .gitignore
 ├── EdgeTAMLive/                     ← run everything from here
 │   ├── README.md                    ← quick reference
+│   ├── .gitignore                   ← local runtime ignores
 │   ├── live_pose_any.py             ← main application
 │   ├── requirements.txt
 │   ├── camera_calibration.npz       ← local (gitignored)
 │   ├── sam3d_live_objects/          ← runtime artifacts (gitignored)
-│   └── EdgeTAM/                     ← segmentation backend
-│       ├── checkpoints/edgetam.pt   ← download separately
+│   ├── posesN.csv                   ← pose logs (gitignored)
+│   └── EdgeTAM/                     ← segmentation backend (clone / pip install -e)
+│       ├── checkpoints/edgetam.pt   ← download separately (~56 MB)
 │       └── configs/edgetam.yaml
 └── archive/                         ← legacy experiments (reference only)
     ├── README.md
@@ -419,6 +498,8 @@ SurgicalToolsPose/
     ├── samples/sam3d_bootstrap/
     └── weights/
 ```
+
+> **Note:** `EdgeTAM/` may be absent in a fresh clone — install with `pip install -e EdgeTAMLive/EdgeTAM` after cloning EdgeTAM into that path, or clone this repo with submodules if configured.
 
 ---
 

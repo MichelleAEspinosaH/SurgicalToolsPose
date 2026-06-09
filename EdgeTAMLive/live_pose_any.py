@@ -5,18 +5,19 @@ Live surgical tool tracking: EdgeTAM seeds → fal SAM3D GLBs → dense PnP 6DoF
 See EdgeTAMLive/README.md and ../README.md for setup, calibration (cm), and CLI.
 
 Pipeline:
-  1. Click seed points on the live camera feed.
+  1. Click seed points on the live camera feed (640×360).
   2. EdgeTAM computes instance masks on the seed frame.
-  3. Confirm masks; fal SAM3D generates a GLB mesh per object.
+  3. Confirm masks (Y/Enter); fal SAM3D generates a GLB mesh per object (parallel).
   4. MeshPoseEstimator (PCA-aligned, dense-perimeter minAreaRect PnP) estimates
      6DoF pose each frame from the EdgeTAM mask, smoothed with Kalman filters.
   5. XYZ axes are projected onto the live video; HUD shows rotation (deg) and
      translation (cm) when checkerboard calibration is loaded.
+  6. Pose log written to posesN.csv (auto-numbered in cwd).
 
 Units:
   - Checkerboard calibration object points: cm (--checkerboard-square-cm 2).
   - SAM3D GLBs: fal normalizes longest axis to 1 m; pipeline converts mesh to cm.
-  - PnP tvec from the mesh is in mm; HUD and CSV multiply by 0.1 for cm display.
+  - PnP tvec from the mesh is in mm; HUD and CSV multiply by PNP_TVEC_MM_TO_CM (0.1).
 
 Usage:
     cd EdgeTAMLive
