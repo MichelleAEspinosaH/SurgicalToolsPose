@@ -13,6 +13,11 @@ Pipeline:
   5. XYZ axes are projected onto the live video; HUD shows rotation (deg) and
      translation (cm) when checkerboard calibration is loaded.
 
+Units:
+  - Checkerboard calibration object points: cm (--checkerboard-square-cm 2).
+  - SAM3D GLBs: fal normalizes longest axis to 1 m; pipeline converts mesh to cm.
+  - PnP tvec from the mesh is in mm; HUD and CSV multiply by 0.1 for cm display.
+
 Usage:
     cd EdgeTAMLive
     python live_pose_any.py --calibrate-only --camera 0

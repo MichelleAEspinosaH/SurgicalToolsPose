@@ -37,7 +37,7 @@ export FAL_KEY="your-fal-api-key"
 python live_pose_any.py --camera 0
 ```
 
-Pose translation is reported in **centimetres** when checkerboard calibration is loaded.
+Pose translation is reported in **centimetres** when checkerboard calibration is loaded (PnP internally uses millimetres; the pipeline converts for display).
 
 ---
 
@@ -62,7 +62,7 @@ Pose translation is reported in **centimetres** when checkerboard calibration is
 
 | Requirement | Notes |
 |-------------|-------|
-| **Python 3.10+** | EdgeTAM requires 3.10 or newer |
+| **Python 3.9+** | 3.10+ recommended; EdgeTAM may warn on older builds |
 | **Camera** | Webcam, phone (Continuity Camera / USB), or Orbbec |
 | **GPU (recommended)** | NVIDIA CUDA or Apple Silicon (MPS); CPU works but is slow |
 | **fal.ai account** | For SAM3D mesh generation ([sign up](https://fal.ai)) |
@@ -181,11 +181,35 @@ Default model ID: `fal-ai/sam-3/3d-objects` (override with `--fal-model`).
 
 Calibration estimates camera **intrinsics** (focal length, distortion). Without it, pose translation in **cm** will be inaccurate.
 
-### Coordinate system (cm)
+### Coordinate system & units
 
-1. Checkerboard object points are in **cm** (`--checkerboard-square-cm 2`).
-2. SAM3D GLBs (glTF metres) are scaled **metres → cm** before PnP.
-3. HUD and CSV report **cm** (e.g. `tz ≈ 40` at ~40 cm distance).
+The pipeline mixes **cm** (calibration, display) and **mm** (SAM3D mesh PnP). Keep this straight when reading logs or CSV.
+
+| Stage | Units | What happens |
+|-------|-------|----------------|
+| Checkerboard object points | **cm** | `--checkerboard-square-cm 2`; stored as `square_cm` in `.npz` |
+| Camera intrinsics `K`, `dist` | **pixels** | From checkerboard calibration |
+| SAM3D GLB mesh | **m → cm** | fal normalizes longest axis to **1 m** (not real tool size); pipeline ×100 to cm for PnP |
+| PnP translation (`tvec`) | **mm** | OpenCV `solvePnP` on mesh vertices |
+| HUD & CSV (`tx_cm`, `ty_cm`, `tz_cm`) | **cm** | Raw mm × **0.1** before display |
+| Rotation (HUD / CSV) | **degrees** | Euler ZYX |
+
+**Example:** seed log `raw 400.0 mm` → HUD `tz ≈ 40.0 cm` at ~40 cm distance.
+
+Optional CLI overrides compare **cm** against **mm** depth directly (no extra ×0.1):
+
+```bash
+python live_pose_any.py --camera 0 --surface-distance-cm 40
+python live_pose_any.py --camera 0 --tool-width-cm 1.2
+```
+
+If depth still looks wrong after calibration, delete stale repaired meshes and re-run:
+
+```bash
+rm sam3d_live_objects/*_repaired.glb
+```
+
+Check startup logs for `[IDn] mesh units:` and `[IDn] SAM3D depth scale:`.
 
 ### Squares vs inner corners
 
@@ -257,16 +281,11 @@ The same summary prints when calibration is auto-loaded at tracking startup.
 | `num_samples` | Captured views |
 | `width`, `height` | Calibration resolution |
 
-Legacy files with `square_mm` still load (converted to cm).
+Legacy files with `square_mm` still load (auto-converted to cm).
 
 ### Optional metric overrides
 
-```bash
-python live_pose_any.py --camera 0 --surface-distance-cm 40
-python live_pose_any.py --camera 0 --tool-width-cm 1.2
-```
-
-If depth looks wrong after an older build, delete `sam3d_live_objects/*_repaired.glb` caches and re-run.
+See [Coordinate system & units](#coordinate-system--units) above. `--surface-distance-cm` and `--tool-width-cm` bypass the default mm→cm mesh scale when you know the true depth or tool width.
 
 ---
 
@@ -295,6 +314,8 @@ Calibration file: .../camera_calibration.npz
 Pose display: rotation (deg), translation (cm) — checkerboard cal (2 cm squares); SAM3D mesh scaled to cm for PnP
 ```
 
+After mask confirmation, fal SAM3D runs **in parallel** per object (upload → infer → download). The seed-frame window shows status per ID; console logs timing, e.g. `ID1 fal: OK — upload 0.3s, infer 13.2s, download 0.5s`.
+
 ```bash
 python live_pose_any.py --camera 0 --output tracking.mp4
 python live_pose_any.py --camera 0 --device mps
@@ -310,8 +331,9 @@ python live_pose_any.py --calibrate-checkerboard --camera 0
 2. Click seed points per tool → Enter
 3. EdgeTAM masks on frozen seed frame
 4. Confirm masks → Y / Enter
-5. fal SAM3D builds GLB per object
-6. Live tracking with pose axes + HUD (cm)
+5. fal SAM3D builds GLB per object (parallel; status overlay per ID)
+6. Mesh registration + pinhole depth fit on seed mask
+7. Live tracking with pose axes + HUD (translation in cm)
 ```
 
 | Seed window | Action |
@@ -332,7 +354,8 @@ python live_pose_any.py --calibrate-checkerboard --camera 0
 | CSV log | `posesN.csv` (cwd) | `tx_cm`, `ty_cm`, `tz_cm` + Euler angles |
 | Seed frame | `sam3d_live_objects/seed_frame.png` | RGB sent to SAM3D |
 | Masks | `sam3d_live_objects/mask_<id>.png` | Per-object masks |
-| GLB meshes | `sam3d_live_objects/object_<id>.glb` | fal SAM3D models |
+| GLB meshes | `sam3d_live_objects/object_<id>.glb` | fal SAM3D models (1 m normalized axis) |
+| Repaired GLB cache | `sam3d_live_objects/object_<id>_repaired.glb` | Local mesh cache (delete if scale wrong) |
 | Video | `--output path.mp4` | Annotated recording |
 
 ---
@@ -359,7 +382,8 @@ python live_pose_any.py [options]
 | `--calibration-min-samples` | `15` | Min views before calibrating |
 | `--intrinsics-file` | auto | Override calibration `.npz` |
 | `--surface-distance-cm` | `0` | Known depth override (cm) |
-| `--tool-width-cm` | `0` | Known tool width (cm) |
+| `--tool-width-cm` | `0` | Known tool width (cm); overrides auto scale |
+| `--max-trail` | `60` | COM trail length (frames) |
 | `--alpha` | `0.45` | Mask overlay opacity |
 | `--kalman-process-var` | `5e-3` | Pose smoothing |
 | `--kalman-meas-var` | `1e-3` | Kalman measurement noise |
@@ -425,6 +449,7 @@ rm -rf sam3d_live_objects/*_repaired.glb   # if mesh scale looks wrong
 
 | Problem | Fix |
 |---------|-----|
+| `TypeError: unsupported operand type(s) for \|` on import | Use **Python 3.9+**; script uses postponed type annotations |
 | `Checkpoint not found: .../edgetam.pt` | [Download edgetam.pt](https://github.com/facebookresearch/EdgeTAM/releases/download/v1.0/edgetam.pt) into `EdgeTAMLive/EdgeTAM/checkpoints/` |
 | `No module named 'sam2'` | `pip install -e EdgeTAMLive/EdgeTAM` |
 | `Set FAL_KEY environment variable` | `export FAL_KEY=...` from [dashboard/keys](https://fal.ai/dashboard/keys) |
@@ -432,11 +457,13 @@ rm -rf sam3d_live_objects/*_repaired.glb   # if mesh scale looks wrong
 | Checkerboard not detected | Print at **1:1**; improve lighting; flat board |
 | Confused by board size | MRPT = **9×7 squares** = **8×6 inner corners** |
 | Wrong board flags | Inner corners = squares − 1; MRPT → `--checkerboard-cols 8 --checkerboard-rows 6` |
+| Calibrated with wrong board (e.g. 7×9) | Re-calibrate with correct MRPT flags |
 | RMS > 1.0 px | 20+ varied views; verify 2 cm squares with ruler |
 | `fal_client import failed` | `pip install fal-client` |
 | `Install trimesh` | `pip install trimesh` |
+| fal SAM3D slow (60–120 s per ID) | Normal for remote infer; check console `infer` time; WiFi rarely the bottleneck |
 | Pose jitter | `--kalman-process-var 2e-4` |
-| Translation in cm wrong | Re-calibrate; log should show `mesh units: metres→cm`; delete `*_repaired.glb` caches |
+| Translation in cm wrong (~10× off) | PnP is mm internally; HUD should show cm (×0.1). If still wrong: re-calibrate, check `[IDn] mesh units:` log, delete `*_repaired.glb` |
 | Orbbec upside-down | Auto-detected; same rotation in cal & tracking |
 
 ---
