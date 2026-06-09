@@ -8,7 +8,7 @@ __pycache__/
 dist/
 build/
 
-# ── Virtual environments ───────────────────────────────────────────────────────
+# ── Virtual environments ─────────────────────────────────────────────────────
 venv/
 .venv/
 env/
@@ -42,7 +42,7 @@ dataset_merged/
 dataset_sources/
 runs/
 
-# ── Live pipeline outputs (generated at runtime) ────────────────────────────
+# ── Live pipeline outputs (generated at runtime) ──────────────────────────────
 poses*.csv
 *.mp4
 *.mov
@@ -57,7 +57,7 @@ sam3d_generated_mask/
 *.ply
 !archive/samples/**/*.glb
 
-# ── Legacy experiments (moved to archive/) ───────────────────────────────────
+# ── Obsolete local folders (use archive/experiments/ instead) ─────────────────
 /tests/
 
 # ── Debug / overlay images ────────────────────────────────────────────────────

@@ -2,8 +2,9 @@
 __pycache__/
 *.pyc
 .DS_Store
+.claude/
 
-# Runtime outputs
+# Runtime outputs (see repo root .gitignore)
 poses*.csv
 camera_calibration.npz
 *.mp4
@@ -26,3 +27,7 @@ sam3d_generated_mask/
 
 # Optional SDK clone (install separately)
 pyorbbecsdk/
+
+# Model weights
+*.pt
+*.pth

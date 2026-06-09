@@ -6,17 +6,17 @@ Smoke test for fal SAM 3D Objects API.
   export FAL_KEY="..."
 
   # Blocking wait (simplest — same as submit + get internally):
-  python tests/fal_sam3d_smoke_test.py
+  python archive/experiments/fal_sam3d_smoke_test.py
 
   # Explicit queue API (docs style): submit → request_id → wait with .get()
-  python tests/fal_sam3d_smoke_test.py --submit
+  python archive/experiments/fal_sam3d_smoke_test.py --submit
 
   # submit + webhook (your server receives the result; this script exits after enqueue):
-  python tests/fal_sam3d_smoke_test.py --submit --webhook https://your.server/hook
+  python archive/experiments/fal_sam3d_smoke_test.py --submit --webhook https://your.server/hook
 
   # Your RGB image + single mask PNG (same resolution):
-  python tests/fal_sam3d_smoke_test.py path/to/frame.png path/to/mask.png
-  python tests/fal_sam3d_smoke_test.py --submit path/to/frame.png path/to/mask.png
+  python archive/experiments/fal_sam3d_smoke_test.py path/to/frame.png path/to/mask.png
+  python archive/experiments/fal_sam3d_smoke_test.py --submit path/to/frame.png path/to/mask.png
 
 Or set SAM3D_IMAGE_URL to a public image URL and omit image argv.
 """

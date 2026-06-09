@@ -7,7 +7,7 @@ Usage:
   cd /Users/michelleespinosa/Desktop/SurgicalToolsPose
   source .venv/bin/activate
   export FAL_KEY="..."
-  python tests/edgetam_clicks_to_sam3d_glb.py
+  python archive/experiments/edgetam_clicks_to_sam3d_glb.py
 """
 
 from __future__ import annotations

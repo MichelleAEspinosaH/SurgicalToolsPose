@@ -2,27 +2,22 @@
 """
 Live surgical tool tracking: EdgeTAM seeds → fal SAM3D GLBs → dense PnP 6DoF pose.
 
+See EdgeTAMLive/README.md and ../README.md for setup, calibration (cm), and CLI.
+
 Pipeline:
   1. Click seed points on the live camera feed.
   2. EdgeTAM computes instance masks on the seed frame.
   3. Confirm masks; fal SAM3D generates a GLB mesh per object.
   4. MeshPoseEstimator (PCA-aligned, dense-perimeter minAreaRect PnP) estimates
      6DoF pose each frame from the EdgeTAM mask, smoothed with Kalman filters.
-  5. XYZ axes are projected onto the live video.
+  5. XYZ axes are projected onto the live video; HUD shows rotation (deg) and
+     translation (cm) when checkerboard calibration is loaded.
 
 Usage:
-    python live_pose_any.py
-    python live_pose_any.py --camera 1
-    python live_pose_any.py --kalman-process-var 2e-4
-    python live_pose_any.py --no-half --output out.mp4
-
-Checkerboard calibration (MRPT 9×7 = 9×7 squares = 8×6 inner corners, 2 cm squares):
+    cd EdgeTAMLive
     python live_pose_any.py --calibrate-only --camera 0
-    python live_pose_any.py --show-calibration          # inspect saved .npz quality
-    python live_pose_any.py --camera 0   # auto-loads camera_calibration.npz if present
-    python live_pose_any.py --calibrate-checkerboard   # re-calibrate, then track
-
-Metric poses: translation in cm (checkerboard cal + SAM3D mesh scaled metres→cm).
+    python live_pose_any.py --show-calibration
+    python live_pose_any.py --camera 0
 """
 
 import argparse
