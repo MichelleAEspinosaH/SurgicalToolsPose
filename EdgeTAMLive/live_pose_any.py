@@ -20,6 +20,8 @@ Usage:
     python live_pose_any.py --camera 0
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import os
@@ -70,6 +72,8 @@ _MAX_COM_TRAIL = 60
 CHECKERBOARD_INNER_COLS = 8
 CHECKERBOARD_INNER_ROWS = 6
 CHECKERBOARD_SQUARE_CM  = 2.0   # 2 cm squares (20 mm at 1:1 print); object points in cm
+# SAM3D mesh PnP tvec is in mm; checkerboard cal and HUD/CSV use cm.
+PNP_TVEC_MM_TO_CM = 0.1
 DEFAULT_CALIBRATION_NPZ = Path(__file__).resolve().parent / "camera_calibration.npz"
 
 # ---------------------------------------------------------------------------
@@ -1130,11 +1134,12 @@ def _compute_cm_scale(
     registration_depth_scale: float = 1.0,
 ) -> float | None:
     """
-    Scale PnP tvec to centimetres for display.
+    Scale PnP tvec to centimetres for HUD / CSV.
 
-    With checkerboard cal + SAM3D meshes, registration_depth_scale (pinhole
-    fit on seed mask) corrects the 1 m normalized axis. Optional CLI overrides
-    take precedence.
+    SAM3D mesh solvePnP returns tvec in millimetres; checkerboard calibration
+    uses centimetres. With mesh_in_cm, registration_depth_scale (pinhole fit on
+    the seed mask) is multiplied by PNP_TVEC_MM_TO_CM. CLI overrides
+    (surface distance, tool width) already match cm against mm depth.
     """
     t = np.asarray(tvec, dtype=np.float64).reshape(3)
     tz = max(abs(float(t[2])), 1e-9)
@@ -1147,7 +1152,7 @@ def _compute_cm_scale(
             return None
         return (f * float(tool_width_cm) / L_px) / tz
     if mesh_in_cm:
-        return max(float(registration_depth_scale), 1e-9)
+        return max(float(registration_depth_scale), 1e-9) * PNP_TVEC_MM_TO_CM
     return None
 
 
@@ -1562,10 +1567,11 @@ def _load_mesh_and_register(oid, glb_path, mb, K, dist, mesh_in_cm: bool = False
         if mesh_in_cm and st.get("tvec") is not None:
             ds = _sam3d_registration_depth_scale(est, mb, K, st["tvec"])
             st["registration_depth_scale"] = ds
-            tz0 = abs(float(np.asarray(st["tvec"], dtype=np.float64).reshape(3)[2]))
+            tz_mm = abs(float(np.asarray(st["tvec"], dtype=np.float64).reshape(3)[2]))
+            tz_cm = tz_mm * PNP_TVEC_MM_TO_CM
             print(
                 f"[ID{oid}] SAM3D depth scale: {ds:.3f}  "
-                f"(seed tz={tz0:.1f} cm → ~{tz0 * ds:.1f} cm after pinhole fit)"
+                f"(seed tz={tz_cm:.1f} cm, raw {tz_mm:.1f} mm → ~{tz_cm * ds:.1f} cm after pinhole fit)"
             )
     print(f"[ID{oid}] estimator ready  pnp_n={est._pnp_n}"
           + ("  (repaired cache)" if use_cache else ""))
