@@ -16,10 +16,13 @@ Usage:
     python live_pose_any.py --kalman-process-var 2e-4
     python live_pose_any.py --no-half --output out.mp4
 
-Checkerboard calibration (MRPT 9×7 squares @ 20 mm, print 1:1 on A4):
+Checkerboard calibration (MRPT 9×7 = 9×7 squares = 8×6 inner corners, 2 cm squares):
     python live_pose_any.py --calibrate-only --camera 0
+    python live_pose_any.py --show-calibration          # inspect saved .npz quality
     python live_pose_any.py --camera 0   # auto-loads camera_calibration.npz if present
     python live_pose_any.py --calibrate-checkerboard   # re-calibrate, then track
+
+Metric poses: translation in cm (checkerboard cal + SAM3D mesh scaled metres→cm).
 """
 
 import argparse
@@ -66,11 +69,12 @@ PNP_SHIFT_PENALTY  = 0.75
 
 _MAX_COM_TRAIL = 60
 
-# MRPT 9×7 checkerboard (9 squares × 7 squares, 20 mm) — inner corners for OpenCV:
+# MRPT 9×7 checkerboard — count squares on the print, OpenCV uses inner corners:
+#   9×7 squares  →  --checkerboard-cols 8  --checkerboard-rows 6
 # https://www.mrpt.org/downloads/camera-calibration-checker-board_9x7.pdf
 CHECKERBOARD_INNER_COLS = 8
 CHECKERBOARD_INNER_ROWS = 6
-CHECKERBOARD_SQUARE_MM  = 20.0
+CHECKERBOARD_SQUARE_CM  = 2.0   # 2 cm squares (20 mm at 1:1 print); object points in cm
 DEFAULT_CALIBRATION_NPZ = Path(__file__).resolve().parent / "camera_calibration.npz"
 
 # ---------------------------------------------------------------------------
@@ -283,11 +287,78 @@ def _load_intrinsics_from_file(path, target_w, target_h):
     return K.astype(np.float64), dist.astype(np.float64)
 
 
+def _read_calibration_meta(path: Path) -> dict | None:
+    """Load summary fields from a checkerboard .npz (or None if unreadable)."""
+    try:
+        data = np.load(path, allow_pickle=False)
+    except Exception:
+        return None
+    meta: dict = {"path": str(path.resolve())}
+    if "reprojection_error" in data:
+        meta["rms_px"] = float(np.asarray(data["reprojection_error"]).reshape(-1)[0])
+    if "num_samples" in data:
+        meta["num_samples"] = int(np.asarray(data["num_samples"]).reshape(-1)[0])
+    if "checkerboard_cols" in data and "checkerboard_rows" in data:
+        meta["inner_cols"] = int(np.asarray(data["checkerboard_cols"]).reshape(-1)[0])
+        meta["inner_rows"] = int(np.asarray(data["checkerboard_rows"]).reshape(-1)[0])
+    if "square_cm" in data:
+        meta["square_cm"] = float(np.asarray(data["square_cm"]).reshape(-1)[0])
+    elif "square_mm" in data:
+        meta["square_cm"] = float(np.asarray(data["square_mm"]).reshape(-1)[0]) / 10.0
+        meta["legacy_square_mm"] = True
+    if "K" in data:
+        K = np.asarray(data["K"], dtype=np.float64).reshape(3, 3)
+        meta["fx"] = float(K[0, 0])
+        meta["fy"] = float(K[1, 1])
+    if "width" in data and "height" in data:
+        meta["width"] = int(np.asarray(data["width"]).reshape(-1)[0])
+        meta["height"] = int(np.asarray(data["height"]).reshape(-1)[0])
+    return meta
+
+
+def _rms_quality_label(rms_px: float) -> str:
+    if rms_px < 0.5:
+        return "good"
+    if rms_px < 1.0:
+        return "acceptable"
+    return "poor — recalibrate"
+
+
+def _print_calibration_summary(path: Path) -> bool:
+    """Print RMS, board size, and intrinsics from a saved calibration file."""
+    meta = _read_calibration_meta(path)
+    if meta is None:
+        print(f"Could not read calibration: {path}")
+        return False
+    print(f"Calibration file: {meta['path']}")
+    if "rms_px" in meta:
+        print(
+            f"  RMS reprojection error: {meta['rms_px']:.4f} px "
+            f"({_rms_quality_label(meta['rms_px'])})"
+        )
+    if "num_samples" in meta:
+        print(f"  Captured views: {meta['num_samples']}")
+    if "inner_cols" in meta and "inner_rows" in meta:
+        ic, ir = meta["inner_cols"], meta["inner_rows"]
+        print(
+            f"  Board: {ic}×{ir} inner corners "
+            f"({ic + 1}×{ir + 1} squares)"
+        )
+    if "square_cm" in meta:
+        note = " (legacy file used mm → converted to cm)" if meta.get("legacy_square_mm") else ""
+        print(f"  Square size: {meta['square_cm']:g} cm{note}")
+    if "fx" in meta and "fy" in meta:
+        print(f"  fx={meta['fx']:.1f}  fy={meta['fy']:.1f}")
+    if "width" in meta and "height" in meta:
+        print(f"  Resolution: {meta['width']}×{meta['height']}")
+    return True
+
+
 def _load_metric_context(intrinsics_file: str, intr_src: str) -> dict:
-    """Return whether to show metric mm poses (checkerboard .npz)."""
+    """Return whether to show metric cm poses (checkerboard .npz)."""
     ctx = {
-        "use_mm": False,
-        "square_mm": CHECKERBOARD_SQUARE_MM,
+        "use_metric": False,
+        "square_cm": CHECKERBOARD_SQUARE_CM,
         "source": "",
     }
     path_str = intrinsics_file
@@ -302,11 +373,13 @@ def _load_metric_context(intrinsics_file: str, intr_src: str) -> dict:
         data = np.load(path, allow_pickle=False)
     except Exception:
         return ctx
-    if "square_mm" in data or "checkerboard_cols" in data or "checkerboard_rows" in data:
-        ctx["use_mm"] = True
+    if "square_cm" in data or "square_mm" in data or "checkerboard_cols" in data or "checkerboard_rows" in data:
+        ctx["use_metric"] = True
         ctx["source"] = str(path)
-        if "square_mm" in data:
-            ctx["square_mm"] = float(np.asarray(data["square_mm"]).reshape(-1)[0])
+        if "square_cm" in data:
+            ctx["square_cm"] = float(np.asarray(data["square_cm"]).reshape(-1)[0])
+        elif "square_mm" in data:
+            ctx["square_cm"] = float(np.asarray(data["square_mm"]).reshape(-1)[0]) / 10.0
     return ctx
 
 
@@ -377,11 +450,11 @@ def _resolve_pose_intrinsics(cap, target_w, target_h, intrinsics_file, try_orbbe
 # Checkerboard calibration  (OpenCV calibrateCamera)
 # ---------------------------------------------------------------------------
 
-def _checkerboard_object_points(cols: int, rows: int, square_mm: float) -> np.ndarray:
-    """3-D corner coordinates on the Z=0 board plane (mm), float32 for OpenCV."""
+def _checkerboard_object_points(cols: int, rows: int, square_cm: float) -> np.ndarray:
+    """3-D corner coordinates on the Z=0 board plane (cm), float32 for OpenCV."""
     objp = np.zeros((rows * cols, 3), dtype=np.float32)
     grid = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
-    objp[:, :2] = (grid * float(square_mm)).astype(np.float32)
+    objp[:, :2] = (grid * float(square_cm)).astype(np.float32)
     return objp
 
 
@@ -440,7 +513,7 @@ def run_checkerboard_calibration(args) -> bool:
     Frames are preprocessed exactly like the live pose pipeline (resize to
     TARGET_SIZE, optional Orbbec 180° rotation) so K/dist match PnP input.
 
-    Defaults match the MRPT 9×7 PDF (8×6 inner corners, 20 mm squares).
+    Defaults match the MRPT 9×7 PDF (8×6 inner corners, 2 cm / 20 mm squares).
     """
     cols = int(args.checkerboard_cols)
     rows = int(args.checkerboard_rows)
@@ -448,7 +521,7 @@ def run_checkerboard_calibration(args) -> bool:
         print("Checkerboard must have at least 3×3 inner corners.")
         return False
 
-    square_mm = float(args.checkerboard_square_mm)
+    square_cm = float(args.checkerboard_square_cm)
     min_samples = max(3, int(args.calibration_min_samples))
     target_w, target_h = TARGET_SIZE
     out_path = Path(args.calibration_out).expanduser().resolve()
@@ -464,9 +537,9 @@ def run_checkerboard_calibration(args) -> bool:
     print(
         f"Checkerboard calibration  camera={args.camera}  "
         f"inner corners={cols}×{rows}  ({squares_x}×{squares_y} squares)  "
-        f"square={square_mm:g} mm  resolution={target_w}×{target_h}"
+        f"square={square_cm:g} cm  resolution={target_w}×{target_h}"
     )
-    print("Board: MRPT 9×7 @ 20 mm — print PDF at 1:1 scale on A4.")
+    print("Board: MRPT 9×7 @ 2 cm (20 mm) squares — print PDF at 1:1 scale on A4.")
     if rotate_180:
         print("Orbbec detected — frames rotated 180° (same as live tracking).")
 
@@ -477,7 +550,7 @@ def run_checkerboard_calibration(args) -> bool:
 
     def _active_objp(pattern: tuple[int, int]) -> np.ndarray:
         pc, pr = pattern
-        return _checkerboard_object_points(pc, pr, square_mm)
+        return _checkerboard_object_points(pc, pr, square_cm)
 
     def _draw_panel(frame: np.ndarray, found: bool, corners, pattern) -> np.ndarray:
         vis = frame.copy()
@@ -493,7 +566,7 @@ def run_checkerboard_calibration(args) -> bool:
         )
         lines = [
             f"Samples: {n}/{min_samples}  ({status})",
-            f"Board: {pat_txt}, {square_mm:g} mm squares",
+            f"Board: {pat_txt}, {square_cm:g} cm squares",
             "SPACE: capture   U: undo last   C/Enter: calibrate   Q/ESC: cancel",
         ]
         y = 24
@@ -579,21 +652,15 @@ def run_checkerboard_calibration(args) -> bool:
         checkerboard_rows=np.int32(active_rows),
         checkerboard_squares_x=np.int32(active_cols + 1),
         checkerboard_squares_y=np.int32(active_rows + 1),
-        square_mm=np.float64(square_mm),
+        square_cm=np.float64(square_cm),
         num_samples=np.int32(len(objpoints)),
-        source=np.array("mrpt_9x7_20mm"),
+        source=np.array("mrpt_9x7_2cm"),
     )
     print(f"Saved calibration: {out_path}")
-    print(
-        f"  RMS reprojection error: {rms:.4f} px  "
-        f"(aim for < 0.5 px; > 1.0 px → recapture with more/better views)"
-    )
-    print(
-        f"  fx={K[0,0]:.2f}  fy={K[1,1]:.2f}  "
-        f"cx={K[0,2]:.2f}  cy={K[1,2]:.2f}"
-    )
-    print(f"  dist={dist.ravel()}")
-    print(f"\nNext run:\n  python live_pose_any.py --camera {args.camera}")
+    _print_calibration_summary(out_path)
+    print(f"  cx={K[0,2]:.2f}  cy={K[1,2]:.2f}  dist={dist.ravel()}")
+    print(f"\nInspect anytime:\n  python live_pose_any.py --show-calibration")
+    print(f"Next run:\n  python live_pose_any.py --camera {args.camera}")
     return True
 
 # ---------------------------------------------------------------------------
@@ -760,6 +827,24 @@ def _apply_kalman_pose_filter(state, rv, tv, process_var, meas_var):
 # ---------------------------------------------------------------------------
 # MeshPoseEstimator  —  dense minAreaRect PnP  (from live_track.py)
 # ---------------------------------------------------------------------------
+
+def _convert_mesh_to_cm(mesh) -> tuple:
+    """
+    Put SAM3D GLB vertices in centimetres to match checkerboard calibration.
+
+    calibrateCamera used cm object points, so solvePnP tvec is in cm only when
+    model points are also in cm.  glTF/GLB uses metres (1 unit = 1 m).
+    """
+    mesh = mesh.copy()
+    span = float(np.ptp(np.asarray(mesh.vertices, dtype=np.float64), axis=0).max())
+    if span < 1.0:
+        mesh.apply_scale(100.0)
+        return mesh, 100.0, f"metres→cm (GLB span {span:.4g} m)"
+    if span > 30.0:
+        mesh.apply_scale(0.1)
+        return mesh, 0.1, f"mm→cm (legacy mesh span {span:.1f})"
+    return mesh, 1.0, f"already cm-scale (span {span:.1f} cm)"
+
 
 class MeshPoseEstimator:
     """
@@ -960,7 +1045,7 @@ def _draw_pose_axes(vis, state, K, dist, axis_pts, obj_id) -> None:
     cv2.putText(vis, "Z", (z_tip[0] + 4, z_tip[1] + 4), fnt, 0.50, (220, 80,  0), 1, cv2.LINE_AA)
 
 
-def _draw_pose_hud(vis: np.ndarray, pose_states: dict, use_mm: bool = False) -> None:
+def _draw_pose_hud(vis: np.ndarray, pose_states: dict, use_metric: bool = False) -> None:
     if not pose_states:
         return
     x0, y0, line_h = 12, 18, 18
@@ -970,15 +1055,15 @@ def _draw_pose_hud(vis: np.ndarray, pose_states: dict, use_mm: bool = False) -> 
         rvec = st.get("rvec")
         if rvec is None:
             continue
-        if use_mm and st.get("tvec_mm") is not None:
-            tv3 = np.asarray(st["tvec_mm"], dtype=np.float64).reshape(3)
-            t_label = "mm"
+        if use_metric and st.get("tvec_cm") is not None:
+            tv3 = np.asarray(st["tvec_cm"], dtype=np.float64).reshape(3)
+            t_label = "cm"
         else:
             tvec = st.get("tvec_cal") or st.get("tvec")
             if tvec is None:
                 continue
             tv3 = np.asarray(tvec, dtype=np.float64).reshape(3)
-            t_label = "mm" if use_mm else ("cm" if st.get("tvec_cal") is not None else "u")
+            t_label = "cm" if st.get("tvec_cal") is not None else "u"
         euler = st.get("euler_deg")
         if euler is None:
             rx, ry, rz = _pose_to_euler_zyx_deg(rvec)
@@ -1000,60 +1085,67 @@ def _mask_major_axis_px(mask_bool: np.ndarray) -> float:
     return float(max(w, h))
 
 
-def _compute_mm_scale(
+def _compute_cm_scale(
     mask_bool: np.ndarray,
     K: np.ndarray,
     tvec,
-    est: "MeshPoseEstimator",
     *,
     surface_distance_cm: float,
-    tool_width_mm: float,
+    tool_width_cm: float,
+    mesh_in_cm: bool,
 ) -> float | None:
-    """Convert PnP translation (mesh units) to millimeters."""
+    """
+    Scale PnP tvec to centimetres for display.
+
+    When mesh_in_cm is True (GLB converted metres→cm), tvec from solvePnP is
+    already in cm because checkerboard cal used cm object points — scale=1.
+    Optional overrides correct residual SAM3D scale error.
+    """
     t = np.asarray(tvec, dtype=np.float64).reshape(3)
     tz = max(abs(float(t[2])), 1e-9)
-    f = 0.5 * (float(K[0, 0]) + float(K[1, 1]))
-    L_px = _mask_major_axis_px(mask_bool)
-    if L_px < 1e-3:
-        return None
-    L_mesh = 2.0 * max(float(est.hP), float(est.hS))
     if surface_distance_cm > 0:
-        return float(surface_distance_cm) * 10.0 / tz
-    if tool_width_mm > 0:
-        return (f * float(tool_width_mm) / L_px) / tz
-    # Checkerboard intrinsics: pinhole depth Z_mm = f * L_mesh_mm / L_px with L_mesh_mm = L_mesh * scale
-    return f * L_mesh / (L_px * tz)
+        return float(surface_distance_cm) / tz
+    if tool_width_cm > 0:
+        f = 0.5 * (float(K[0, 0]) + float(K[1, 1]))
+        L_px = _mask_major_axis_px(mask_bool)
+        if L_px < 1e-3:
+            return None
+        return (f * float(tool_width_cm) / L_px) / tz
+    if mesh_in_cm:
+        return 1.0
+    return None
 
 
 def _update_metric_pose_display(
     state: dict,
     mask_bool: np.ndarray,
     K: np.ndarray,
-    est: "MeshPoseEstimator",
     *,
     surface_distance_cm: float,
-    tool_width_mm: float,
-    use_mm: bool,
+    tool_width_cm: float,
+    use_metric: bool,
+    mesh_in_cm: bool,
     ema_alpha: float = 0.12,
 ) -> None:
-    """Populate state['tvec_mm'] and state['euler_deg'] for HUD / CSV."""
-    if not use_mm:
+    """Populate state['tvec_cm'] and state['euler_deg'] for HUD / CSV."""
+    if not use_metric:
         return
     rvec = state.get("rvec")
     tvec = state.get("tvec")
     if rvec is None or tvec is None:
         return
-    scale_now = _compute_mm_scale(
-        mask_bool, K, tvec, est,
+    scale_now = _compute_cm_scale(
+        mask_bool, K, tvec,
         surface_distance_cm=surface_distance_cm,
-        tool_width_mm=tool_width_mm,
+        tool_width_cm=tool_width_cm,
+        mesh_in_cm=mesh_in_cm,
     )
     if scale_now is None:
         return
-    prev = state.get("mm_scale")
+    prev = state.get("cm_scale")
     scale = scale_now if prev is None else (1.0 - ema_alpha) * float(prev) + ema_alpha * scale_now
-    state["mm_scale"] = scale
-    state["tvec_mm"] = np.asarray(tvec, dtype=np.float64).reshape(3) * scale
+    state["cm_scale"] = scale
+    state["tvec_cm"] = np.asarray(tvec, dtype=np.float64).reshape(3) * scale
     state["euler_deg"] = _pose_to_euler_zyx_deg(rvec)
 
 
@@ -1308,7 +1400,7 @@ def _confirm_seed_masks_ui(seed_frame, seed_mask_bool, win_name="Confirm seed ma
 # GLB loader → MeshPoseEstimator
 # ---------------------------------------------------------------------------
 
-def _load_mesh_and_register(oid, glb_path, mb, K, dist) -> tuple:
+def _load_mesh_and_register(oid, glb_path, mb, K, dist, mesh_in_cm: bool = False) -> tuple:
     if trimesh is None:
         print("trimesh required — pip install trimesh")
         return oid, None, {}
@@ -1331,6 +1423,10 @@ def _load_mesh_and_register(oid, glb_path, mb, K, dist) -> tuple:
             mesh = loaded
         else:
             raise ValueError(f"unsupported mesh type: {type(loaded)}")
+
+        if mesh_in_cm:
+            mesh, _, cm_reason = _convert_mesh_to_cm(mesh)
+            print(f"[ID{oid}] mesh units: {cm_reason}")
 
         if not use_cache:
             try:
@@ -1387,8 +1483,14 @@ def run(args) -> None:
     metric_ctx = _load_metric_context(args.intrinsics_file, intr_src)
     print(f"Intrinsics ({intr_src}): fx={K_cam[0,0]:.1f}  fy={K_cam[1,1]:.1f}  "
           f"cx={K_cam[0,2]:.1f}  cy={K_cam[1,2]:.1f}")
-    if metric_ctx["use_mm"]:
-        print("Pose display: rotation in degrees, translation in mm (checkerboard calibration)")
+    if metric_ctx["use_metric"]:
+        sq = metric_ctx["square_cm"]
+        print(
+            f"Pose display: rotation (deg), translation (cm) — "
+            f"checkerboard cal ({sq:g} cm squares); SAM3D mesh scaled to cm for PnP"
+        )
+        if args.surface_distance_cm > 0 or args.tool_width_cm > 0:
+            print("  Optional scale override: --surface-distance-cm / --tool-width-cm")
     elif args.surface_distance_cm > 0:
         print(f"Pose display: translation scaled to cm via surface distance {args.surface_distance_cm:g} cm")
 
@@ -1507,21 +1609,25 @@ def run(args) -> None:
             if not glb_path.is_file():
                 print(f"Missing GLB for ID{oid}, skipping."); continue
             mb  = seed_masks_raw.get(oid, np.zeros((fh, fw), dtype=bool))
-            fut = reg_ex.submit(_load_mesh_and_register, oid, glb_path, mb, K_cam, dist_cam)
+            fut = reg_ex.submit(
+                _load_mesh_and_register, oid, glb_path, mb, K_cam, dist_cam,
+                metric_ctx["use_metric"],
+            )
             glb_futs[fut] = oid
         for fut in as_completed(glb_futs):
             oid, est, st = fut.result()
             if est is not None:
                 mesh_estimators[oid] = est
                 pose_states[oid]     = st
-                if metric_ctx["use_mm"]:
+                if metric_ctx["use_metric"]:
                     mb = seed_masks_raw.get(oid)
                     if mb is not None and np.any(mb):
                         _update_metric_pose_display(
-                            pose_states[oid], mb, K_cam, est,
+                            pose_states[oid], mb, K_cam,
                             surface_distance_cm=args.surface_distance_cm,
-                            tool_width_mm=args.tool_width_mm,
-                            use_mm=True,
+                            tool_width_cm=args.tool_width_cm,
+                            use_metric=True,
+                            mesh_in_cm=True,
                         )
     print(f"Timing: load + seed pose = {time.perf_counter()-t_reg0:.3f}s")
 
@@ -1532,10 +1638,8 @@ def run(args) -> None:
     csv_path   = _next_pose_csv_path(Path.cwd())
     csv_file   = open(csv_path, "w", newline="", encoding="utf-8")
     csv_writer = csv.writer(csv_file)
-    use_mm_csv = metric_ctx["use_mm"]
-    if use_mm_csv:
-        t_cols = ["tx_mm", "ty_mm", "tz_mm"]
-    elif args.surface_distance_cm > 0:
+    use_metric_csv = metric_ctx["use_metric"] or args.surface_distance_cm > 0
+    if use_metric_csv:
         t_cols = ["tx_cm", "ty_cm", "tz_cm"]
     else:
         t_cols = ["tx", "ty", "tz"]
@@ -1575,12 +1679,13 @@ def run(args) -> None:
                             kalman_process_var=args.kalman_process_var,
                             kalman_meas_var=args.kalman_meas_var,
                         )
-                        if metric_ctx["use_mm"]:
+                        if metric_ctx["use_metric"]:
                             _update_metric_pose_display(
-                                pose_states[oid], binm, K_cam, est,
+                                pose_states[oid], binm, K_cam,
                                 surface_distance_cm=args.surface_distance_cm,
-                                tool_width_mm=args.tool_width_mm,
-                                use_mm=True,
+                                tool_width_cm=args.tool_width_cm,
+                                use_metric=True,
+                                mesh_in_cm=True,
                             )
                         elif args.surface_distance_cm > 0:
                             _update_translation_calibration_from_surface(
@@ -1608,7 +1713,7 @@ def run(args) -> None:
                         cv2.putText(vis, f"ID{oid}", (trail[-1][0] + 8, trail[-1][1] - 8),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1, cv2.LINE_AA)
 
-                _draw_pose_hud(vis, pose_states, use_mm=metric_ctx["use_mm"])
+                _draw_pose_hud(vis, pose_states, use_metric=metric_ctx["use_metric"])
 
                 if fi == 0:
                     for oid, px, py in points:
@@ -1628,8 +1733,8 @@ def run(args) -> None:
                     rvec = st.get("rvec")
                     if rvec is None:
                         continue
-                    if use_mm_csv and st.get("tvec_mm") is not None:
-                        tv3 = np.asarray(st["tvec_mm"], dtype=np.float64).reshape(3)
+                    if use_metric_csv and st.get("tvec_cm") is not None:
+                        tv3 = np.asarray(st["tvec_cm"], dtype=np.float64).reshape(3)
                     else:
                         _tc = st.get("tvec_cal")
                         tvec = _tc if _tc is not None else st.get("tvec")
@@ -1670,7 +1775,8 @@ def _apply_calibration_defaults(args) -> None:
     if calib_path.is_file():
         args.intrinsics_file = str(calib_path)
         args.no_orbbec_intrinsics = True
-        print(f"Using checkerboard calibration: {calib_path}")
+        print("Using checkerboard calibration:")
+        _print_calibration_summary(calib_path)
 
 
 def main() -> None:
@@ -1692,6 +1798,8 @@ def main() -> None:
         help="Directory for seed PNG, masks, and downloaded GLBs.")
     parser.add_argument("--intrinsics-file", default="",
         help="Optional .npz with K (3x3), optional dist, optional width/height.")
+    parser.add_argument("--show-calibration", action="store_true",
+        help="Print RMS and metadata from --calibration-out .npz, then exit.")
     parser.add_argument("--calibrate-only", action="store_true",
         help="Run interactive checkerboard calibration and exit (no tracking).")
     parser.add_argument("--calibrate-checkerboard", action="store_true",
@@ -1702,19 +1810,23 @@ def main() -> None:
         help="Inner corners along board width (MRPT 9×7 PDF → 8).")
     parser.add_argument("--checkerboard-rows", type=int, default=CHECKERBOARD_INNER_ROWS,
         help="Inner corners along board height (MRPT 9×7 PDF → 6).")
-    parser.add_argument("--checkerboard-square-mm", type=float, default=CHECKERBOARD_SQUARE_MM,
-        help="Physical square size in mm (MRPT 9×7 PDF → 20, print at 1:1 on A4).")
+    parser.add_argument("--checkerboard-square-cm", type=float, default=CHECKERBOARD_SQUARE_CM,
+        help="Physical square size in cm (MRPT 9×7 PDF → 2 cm / 20 mm, print at 1:1 on A4).")
     parser.add_argument("--calibration-min-samples", type=int, default=15,
         help="Minimum captured views before calibrateCamera runs.")
     parser.add_argument("--no-orbbec-intrinsics", action="store_true",
         help="Skip Orbbec SDK intrinsics lookup.")
     parser.add_argument("--surface-distance-cm", type=float, default=0.0,
-        help="Known camera→surface distance in cm; overrides auto mm scale when set.")
-    parser.add_argument("--tool-width-mm", type=float, default=0.0,
-        help="Known tool width in mm for metric translation (optional).")
+        help="Known camera→object distance in cm; overrides auto cm scale when set.")
+    parser.add_argument("--tool-width-cm", type=float, default=0.0,
+        help="Known tool width in cm for metric translation (optional).")
     parser.add_argument("--align-debug-out", default="",
         help="Optional path to save registration debug image each frame.")
     args = parser.parse_args()
+
+    if args.show_calibration:
+        calib_path = Path(args.calibration_out).expanduser().resolve()
+        sys.exit(0 if _print_calibration_summary(calib_path) else 1)
 
     if args.calibrate_only:
         sys.exit(0 if run_checkerboard_calibration(args) else 1)

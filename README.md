@@ -149,25 +149,47 @@ The default model ID in code is `fal-ai/sam-3/3d-objects` (override with `--fal-
 
 ## Camera calibration (required first)
 
-Calibration estimates camera **intrinsics** (focal length, distortion). Without it, pose translation in mm will be inaccurate.
+Calibration estimates camera **intrinsics** (focal length, distortion). Without it, pose translation in **cm** will be inaccurate.
+
+The pipeline uses a **centimetre** coordinate system end to end:
+
+1. Checkerboard object points are in **cm** (`--checkerboard-square-cm 2` = 2 cm squares on the MRPT print).
+2. SAM3D GLBs (glTF metres) are scaled **metres → cm** before PnP.
+3. HUD and CSV report translation in **cm** (e.g. `tz ≈ 40` at ~40 cm distance).
+
+### Squares vs inner corners (important)
+
+OpenCV detects **inner corners** (where four squares meet), not square count.
+
+| What you count on the print | MRPT PDF board | Different board (example) |
+|-----------------------------|----------------|---------------------------|
+| **Squares** (black/white cells) | **9 × 7** | 8 × 10 |
+| **Inner corners** (`--checkerboard-cols/rows`) | **8 × 6** | 7 × 9 |
+
+Rule: **inner corners = squares − 1** in each direction.
+
+The code defaults (`--checkerboard-cols 8 --checkerboard-rows 6`) match the **MRPT 9×7** PDF. If your physical board differs, pass the correct inner-corner counts.
 
 ### Step 1 — Print the checkerboard
 
-Download and print at **100% / actual size** (1:1 scale) on A4:
+Download and print at **100% / actual size** (1:1 scale) on A4 — not “fit to page”:
 
 **[MRPT 9×7 checkerboard PDF](https://www.mrpt.org/downloads/camera-calibration-checker-board_9x7.pdf)**
 
 | Property | Value |
 |----------|-------|
-| Squares | 9 wide × 7 tall |
-| Square size | 20 mm × 20 mm (when printed 1:1) |
-| OpenCV inner corners | **8 × 6** (defaults in code) |
+| Squares on print | 9 wide × 7 tall |
+| Square size | **2 cm** (20 mm when printed 1:1) |
+| CLI inner corners | `--checkerboard-cols 8 --checkerboard-rows 6` |
+| Square size flag | `--checkerboard-square-cm 2` |
 
-Mount the print flat on stiff backing (clipboard, foam board). Avoid glare.
+**Verify with a ruler** after printing: one square must measure 2 cm. Wrong print scale breaks metric depth.
+
+Mount flat on stiff backing (clipboard, foam board). Use matte paper; avoid glare.
 
 ### Step 2 — Run calibration
 
-Use the **same camera** and **same camera index** you will use for tracking:
+Use the **same camera, index, zoom, and focus** you will use for tracking:
 
 ```bash
 cd EdgeTAMLive
@@ -176,40 +198,79 @@ python live_pose_any.py --calibrate-only --camera 0
 
 If your phone is not camera 0, try `--camera 1` or `--camera 2`.
 
-### Step 3 — Capture 15+ views
+Lock phone settings when possible (disable autofocus / digital zoom).
+
+### Step 3 — Capture 15+ diverse views
+
+Default minimum is **15** samples; aim for **20–30** for best results.
 
 | Key | Action |
 |-----|--------|
-| **SPACE** | Capture view (when green corners are detected) |
+| **SPACE** | Capture view (only when green corners are detected) |
 | **U** / Backspace | Undo last capture |
 | **C** or **Enter** | Finish calibration (needs ≥ 15 samples) |
 | **Q** or **ESC** | Cancel |
 
-**Move the board** between captures — center, corners, tilted angles, nearer/farther.
+**Vary each capture** — do not take 15 nearly identical frames:
 
-### Step 4 — Check quality
+- Board in **center, left, right, top, bottom** of the image
+- **Near and far** from the camera
+- **Tilted / rotated** (~30–45°) for distortion estimation
+- Sharp frames only (no motion blur)
 
-When done you should see:
+More samples with more variety:
 
+```bash
+python live_pose_any.py --calibrate-only --camera 0 --calibration-min-samples 25
 ```
-Saved calibration: .../EdgeTAMLive/camera_calibration.npz
-RMS reprojection error: 0.xx px
-```
+
+### Step 4 — Check quality (RMS reprojection error)
+
+When calibration finishes you will see a summary including **RMS reprojection error** in pixels.
 
 | RMS error | Quality |
 |-----------|---------|
 | **< 0.5 px** | Good |
 | 0.5 – 1.0 px | Acceptable |
-| **> 1.0 px** | Re-calibrate with more views / better lighting |
+| **> 1.0 px** | Re-calibrate — more views, better lighting, flatter board |
 
-`camera_calibration.npz` is saved locally and **auto-loaded** on future runs (not committed to git).
-
-### Optional — improve metric translation (mm)
+**Inspect a saved file anytime:**
 
 ```bash
-python live_pose_any.py --camera 0 --surface-distance-cm 40   # known camera-to-table distance
-python live_pose_any.py --camera 0 --tool-width-mm 12         # known tool width
+python live_pose_any.py --show-calibration
 ```
+
+Or read the `.npz` directly:
+
+```bash
+python3 -c "import numpy as np; d=np.load('camera_calibration.npz'); print(f'RMS: {float(d[\"reprojection_error\"]):.4f} px')"
+```
+
+On every tracking run, the startup log prints the same summary when `camera_calibration.npz` is auto-loaded.
+
+### What is saved in `camera_calibration.npz`
+
+| Field | Meaning |
+|-------|---------|
+| `K`, `dist` | Camera intrinsics and distortion |
+| `reprojection_error` | RMS quality metric (px) |
+| `checkerboard_cols/rows` | Inner corners used |
+| `square_cm` | Physical square size in cm |
+| `num_samples` | Number of captured views |
+| `width`, `height` | Resolution used during calibration |
+
+The file is saved locally and **auto-loaded** on future runs (gitignored — not committed).
+
+### Metric translation (cm)
+
+With checkerboard calibration loaded, **no extra flags are needed** for cm poses. Optional overrides if SAM3D mesh scale is still slightly off:
+
+```bash
+python live_pose_any.py --camera 0 --surface-distance-cm 40   # known camera-to-object depth (cm)
+python live_pose_any.py --camera 0 --tool-width-cm 1.2        # known tool width (cm)
+```
+
+If depth looks wrong after switching from an older mm-based build, delete cached `sam3d_live_objects/*_repaired.glb` files and re-run tracking.
 
 ---
 
@@ -231,8 +292,11 @@ python live_pose_any.py --camera 0
 You should see:
 
 ```
-Using checkerboard calibration: .../camera_calibration.npz
-Pose display: rotation in degrees, translation in mm (checkerboard calibration)
+Using checkerboard calibration:
+Calibration file: .../camera_calibration.npz
+  RMS reprojection error: 0.xx px (good)
+  ...
+Pose display: rotation (deg), translation (cm) — checkerboard cal (2 cm squares); SAM3D mesh scaled to cm for PnP
 ```
 
 ### Useful run options
@@ -281,8 +345,8 @@ python live_pose_any.py --calibrate-checkerboard --camera 0 # re-calibrate, then
 
 | Output | Location | Description |
 |--------|----------|-------------|
-| Pose HUD | On-screen | `R(rx,ry,rz)deg  T(tx,ty,tz)mm` per object |
-| CSV log | `posesN.csv` (cwd) | Per-frame Euler angles + `tx_mm`, `ty_mm`, `tz_mm` |
+| Pose HUD | On-screen | `R(rx,ry,rz)deg  T(tx,ty,tz)cm` per object |
+| CSV log | `posesN.csv` (cwd) | Per-frame Euler angles + `tx_cm`, `ty_cm`, `tz_cm` |
 | Seed frame | `sam3d_live_objects/seed_frame.png` | Frozen RGB used for SAM3D |
 | Masks | `sam3d_live_objects/mask_<id>.png` | Per-object masks sent to fal |
 | GLB meshes | `sam3d_live_objects/object_<id>.glb` | 3D models from fal SAM3D |
@@ -301,15 +365,16 @@ python live_pose_any.py [options]
 | `--camera` | `0` | OpenCV camera index |
 | `--device` | `auto` | `cuda`, `mps`, or `cpu` |
 | `--calibrate-only` | off | Run checkerboard calibration and exit |
+| `--show-calibration` | off | Print RMS / metadata from saved `.npz` and exit |
 | `--calibrate-checkerboard` | off | Calibrate first, then track |
 | `--calibration-out` | `camera_calibration.npz` | Calibration save/load path |
 | `--checkerboard-cols` | `8` | Inner corners width (MRPT 9×7 board) |
 | `--checkerboard-rows` | `6` | Inner corners height |
-| `--checkerboard-square-mm` | `20` | Physical square size (mm) |
+| `--checkerboard-square-cm` | `2` | Physical square size in cm (MRPT PDF → 2 cm / 20 mm) |
 | `--calibration-min-samples` | `15` | Min views before calibrating |
 | `--intrinsics-file` | auto | Override calibration `.npz` path |
 | `--surface-distance-cm` | `0` | Known camera-to-surface distance |
-| `--tool-width-mm` | `0` | Known tool width for metric scale |
+| `--tool-width-cm` | `0` | Known tool width for metric scale (cm) |
 | `--alpha` | `0.45` | Mask overlay opacity |
 | `--kalman-process-var` | `5e-3` | Pose smoothing (lower = smoother) |
 | `--kalman-meas-var` | `1e-3` | Kalman measurement noise |
@@ -355,11 +420,13 @@ SurgicalToolsPose/
 | `Set FAL_KEY environment variable` | `export FAL_KEY=...` from [dashboard/keys](https://fal.ai/dashboard/keys) |
 | `Could not open camera 0` | Try `--camera 1`; close other apps using the camera |
 | Checkerboard not detected | Print PDF at **1:1** scale; improve lighting; hold board flat |
-| Wrong board size flags | MRPT 9×7 → defaults `--checkerboard-cols 8 --checkerboard-rows 6 --checkerboard-square-mm 20` |
+| Confused by board size | MRPT PDF = **9×7 squares** = **8×6 inner corners** (not 8×10 squares) |
+| Wrong board size flags | MRPT 9×7 → `--checkerboard-cols 8 --checkerboard-rows 6 --checkerboard-square-cm 2`; other prints → inner corners = squares − 1 |
+| RMS > 1.0 px | Capture 20+ varied views; flatten board; fix glare; verify 2 cm squares with ruler |
 | `fal_client import failed` | `pip install fal-client` |
 | `Install trimesh` | `pip install trimesh` |
 | Pose jitter | `--kalman-process-var 2e-4` |
-| Translation in mm looks wrong | Re-calibrate; add `--surface-distance-cm` or `--tool-width-mm` |
+| Translation in cm looks wrong | Re-calibrate; confirm log shows `mesh units: metres→cm`; delete old `*_repaired.glb` caches if needed; optional `--surface-distance-cm` / `--tool-width-cm` |
 | Orbbec upside-down image | Auto-detected; same rotation used in calibration and tracking |
 
 ---
@@ -370,7 +437,7 @@ SurgicalToolsPose/
 
 | Item | URL |
 |------|-----|
-| Checkerboard (MRPT 9×7, 20 mm) | https://www.mrpt.org/downloads/camera-calibration-checker-board_9x7.pdf |
+| Checkerboard (MRPT 9×7, 2 cm squares) | https://www.mrpt.org/downloads/camera-calibration-checker-board_9x7.pdf |
 | fal SAM3D model | https://fal.ai/models/fal-ai/sam-3/3d-objects |
 | fal API keys | https://fal.ai/dashboard/keys |
 | fal documentation | https://fal.ai/docs |

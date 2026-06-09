@@ -1,7 +1,7 @@
 # Archive
 
 Older scripts, experiments, and sample assets from earlier development.
-**Not required** to run the current pipeline — see the root [README](../README.md) for `live_pose_any.py`.
+**Not required** to run the current pipeline — see the root [README](../README.md) for `live_pose_any.py` (checkerboard calibration in **cm**, metric poses in **cm**).
 
 ## Layout
 
