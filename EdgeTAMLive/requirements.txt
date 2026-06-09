@@ -1,0 +1,9 @@
+# Core live pose pipeline
+opencv-python>=4.8
+numpy>=1.24
+torch>=2.0
+trimesh>=4.0
+fal-client>=0.5
+
+# Optional: Orbbec camera factory intrinsics
+# pyorbbecsdk  — install from Orbbec SDK, not PyPI

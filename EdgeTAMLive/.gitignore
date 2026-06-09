@@ -1,4 +1,28 @@
 .venv/
 __pycache__/
 *.pyc
-.Python
+.DS_Store
+
+# Runtime outputs
+poses*.csv
+camera_calibration.npz
+*.mp4
+*.mov
+Log/
+
+# SAM3D session data
+sam3d_live_objects/
+sam3d_live_bootstrap/
+
+# Meshes & debug images
+*.glb
+*.ply
+mesh_overlay_frames/
+mesh_overlay_frames_test/
+mesh_alignment_overlays/
+my_alignment_pngs/
+sam3d_click_exports/
+sam3d_generated_mask/
+
+# Optional SDK clone (install separately)
+pyorbbecsdk/

@@ -1,37 +1,75 @@
-# ── Orbbec SDK (third-party, install separately) ──────────────────────────────
-pyorbbecsdk/
-
-# ── YOLO training output ───────────────────────────────────────────────────────
-runs/
-
-# ── Runtime logs ──────────────────────────────────────────────────────────────
-Log/
-
-# ── Python cache ──────────────────────────────────────────────────────────────
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
+*.egg-info/
+dist/
+build/
 
 # ── Virtual environments ───────────────────────────────────────────────────────
 venv/
 .venv/
 env/
+.meshfix_venv/
 
-# ── Model weights (too large for GitHub) ──────────────────────────────────────
-*.pt
-*.pth
-*.onnx
-
-# ── Datasets (too large for GitHub) ───────────────────────────────────────────
-dataset_merged/
-dataset_sources/
-
-# ── macOS metadata ─────────────────────────────────────────────────────────────
+# ── IDE / tooling ─────────────────────────────────────────────────────────────
 .DS_Store
-
-# ── Jupyter / IDE ──────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 .vscode/
 .idea/
+.claude/
+
+# ── Runtime logs ──────────────────────────────────────────────────────────────
+Log/
+*.log
+
+# ── Model weights (download separately) ───────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+!archive/weights/*.pt
+
+# ── Large third-party clones (install locally, not versioned) ─────────────────
+pyorbbecsdk/
+segment-anything-2/
+sam3/
+/EdgeTAM/
+
+# ── Datasets & training output ────────────────────────────────────────────────
+dataset_merged/
+dataset_sources/
+runs/
+
+# ── Live pipeline outputs (generated at runtime) ────────────────────────────
+poses*.csv
+*.mp4
+*.mov
+camera_calibration.npz
+
+# ── SAM3D / mesh artifacts ────────────────────────────────────────────────────
+sam3d_live_objects/
+sam3d_live_bootstrap/
+sam3d_click_exports/
+sam3d_generated_mask/
+*.glb
+*.ply
+!archive/samples/**/*.glb
+
+# ── Legacy experiments (moved to archive/) ───────────────────────────────────
+/tests/
+
+# ── Debug / overlay images ────────────────────────────────────────────────────
+mesh_overlay_frames/
+mesh_overlay_frames_test/
+mesh_alignment_overlays/
+my_alignment_pngs/
+*_overlay*.png
+mapped_*.png
+extracted_*.png
+object_*_axes.png
+combined_scene.glb
+object_transform.npy
+seed_frame.png
+mask_*.png
