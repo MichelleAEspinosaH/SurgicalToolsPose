@@ -823,22 +823,34 @@ def _apply_kalman_pose_filter(state, rv, tv, process_var, meas_var):
 # MeshPoseEstimator  —  dense minAreaRect PnP  (from live_track.py)
 # ---------------------------------------------------------------------------
 
+# fal SAM3D GLBs (glTF): longest axis is normalized to 1 m — not real tool size.
+SAM3D_NORMALIZED_AXIS_M = 1.0
+SAM3D_METRES_SPAN_MAX = 3.0   # raw GLB max extent ≤ this → treat as metres
+SAM3D_CM_SPAN_MIN = 15.0      # repaired / already ×100 → max extent in cm
+
+
 def _convert_mesh_to_cm(mesh) -> tuple:
     """
-    Put SAM3D GLB vertices in centimetres to match checkerboard calibration.
+    Put SAM3D GLB vertices in centimetres for checkerboard-calibrated PnP.
 
-    calibrateCamera used cm object points, so solvePnP tvec is in cm only when
-    model points are also in cm.  glTF/GLB uses metres (1 unit = 1 m).
+    fal SAM3D outputs meshes with the longest axis at 1 m (glTF metres).
+    span ≤ 3 m → ×100.  Already-converted repaired caches (~100 cm) are left
+    as-is.  Legacy mm caches (span > 250) are ×0.1.
     """
     mesh = mesh.copy()
     span = float(np.ptp(np.asarray(mesh.vertices, dtype=np.float64), axis=0).max())
-    if span < 1.0:
+    if span <= SAM3D_METRES_SPAN_MAX:
         mesh.apply_scale(100.0)
-        return mesh, 100.0, f"metres→cm (GLB span {span:.4g} m)"
-    if span > 30.0:
+        return (
+            mesh, 100.0,
+            f"SAM3D 1 m axis → cm (raw extent {span:.4g} m, now {span * 100:.1f} cm)",
+        )
+    if span > 250.0:
         mesh.apply_scale(0.1)
-        return mesh, 0.1, f"mm→cm (legacy mesh span {span:.1f})"
-    return mesh, 1.0, f"already cm-scale (span {span:.1f} cm)"
+        return mesh, 0.1, f"legacy mm→cm (span {span:.1f})"
+    if span >= SAM3D_CM_SPAN_MIN:
+        return mesh, 1.0, f"already cm (extent {span:.1f} cm)"
+    return mesh, 1.0, f"unchanged (extent {span:.2g}, assumed cm)"
 
 
 class MeshPoseEstimator:
@@ -1071,6 +1083,33 @@ def _draw_pose_hud(vis: np.ndarray, pose_states: dict, use_metric: bool = False)
         cv2.putText(vis, text, (x0, yy), fnt, 0.48, (0, 0, 0), 1, cv2.LINE_AA)
 
 
+def _sam3d_registration_depth_scale(
+    est: "MeshPoseEstimator",
+    mask_bool: np.ndarray,
+    K: np.ndarray,
+    tvec,
+) -> float:
+    """
+    Correct PnP depth when SAM3D normalizes longest axis to 1 m.
+
+    Uses pinhole consistency on the seed mask: Z_cm = f * W_mesh_cm / L_px,
+    then depth_scale = Z_cm / tz_pnp so HUD depth matches apparent size.
+    """
+    tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
+    tz = abs(float(tvec[2]))
+    if tz < 1e-9:
+        return 1.0
+    L_px = _mask_major_axis_px(mask_bool)
+    if L_px < 1e-3:
+        return 1.0
+    f = 0.5 * (float(K[0, 0]) + float(K[1, 1]))
+    w_cm = float(np.max(est.extents))
+    if w_cm < 1e-6:
+        return 1.0
+    z_pinhole = f * w_cm / L_px
+    return z_pinhole / tz
+
+
 def _mask_major_axis_px(mask_bool: np.ndarray) -> float:
     ys, xs = np.where(mask_bool)
     if xs.size < 4:
@@ -1088,13 +1127,14 @@ def _compute_cm_scale(
     surface_distance_cm: float,
     tool_width_cm: float,
     mesh_in_cm: bool,
+    registration_depth_scale: float = 1.0,
 ) -> float | None:
     """
     Scale PnP tvec to centimetres for display.
 
-    When mesh_in_cm is True (GLB converted metres→cm), tvec from solvePnP is
-    already in cm because checkerboard cal used cm object points — scale=1.
-    Optional overrides correct residual SAM3D scale error.
+    With checkerboard cal + SAM3D meshes, registration_depth_scale (pinhole
+    fit on seed mask) corrects the 1 m normalized axis. Optional CLI overrides
+    take precedence.
     """
     t = np.asarray(tvec, dtype=np.float64).reshape(3)
     tz = max(abs(float(t[2])), 1e-9)
@@ -1107,7 +1147,7 @@ def _compute_cm_scale(
             return None
         return (f * float(tool_width_cm) / L_px) / tz
     if mesh_in_cm:
-        return 1.0
+        return max(float(registration_depth_scale), 1e-9)
     return None
 
 
@@ -1134,6 +1174,7 @@ def _update_metric_pose_display(
         surface_distance_cm=surface_distance_cm,
         tool_width_cm=tool_width_cm,
         mesh_in_cm=mesh_in_cm,
+        registration_depth_scale=float(state.get("registration_depth_scale", 1.0)),
     )
     if scale_now is None:
         return
@@ -1288,36 +1329,101 @@ class LiveFrameProvider:
 # fal SAM3D GLB generation
 # ---------------------------------------------------------------------------
 
-def _fal_download_glb(fal_model, seed, image_url, mask_path, glb_out) -> tuple[bool, str]:
+def _fal_set_status(
+    status: dict[int, str] | None,
+    lock: threading.Lock | None,
+    oid: int | None,
+    text: str,
+) -> None:
+    if status is None or oid is None:
+        return
+    if lock is not None:
+        with lock:
+            status[oid] = text
+    else:
+        status[oid] = text
+
+
+def _fal_download_glb(
+    fal_model,
+    seed,
+    image_url,
+    mask_path,
+    glb_out,
+    *,
+    oid: int | None = None,
+    status: dict[int, str] | None = None,
+    status_lock: threading.Lock | None = None,
+) -> tuple[bool, str, dict]:
+    timings = {"upload_s": 0.0, "infer_s": 0.0, "download_s": 0.0, "total_s": 0.0}
+    t_total0 = time.perf_counter()
     try:
         import fal_client  # type: ignore
     except Exception as e:
-        return False, f"fal_client import failed: {e}"
+        _fal_set_status(status, status_lock, oid, f"ERR: {e}")
+        return False, f"fal_client import failed: {e}", timings
     try:
+        _fal_set_status(status, status_lock, oid, "uploading mask…")
+        t0 = time.perf_counter()
         mask_url = fal_client.upload_file(str(mask_path))
-        result   = fal_client.subscribe(
+        timings["upload_s"] = time.perf_counter() - t0
+
+        _fal_set_status(status, status_lock, oid, "SAM3D running…")
+        t0 = time.perf_counter()
+        result = fal_client.subscribe(
             fal_model,
             arguments={"image_url": image_url, "mask_urls": [mask_url], "seed": int(seed)},
             with_logs=False,
         )
+        timings["infer_s"] = time.perf_counter() - t0
     except Exception as e:
-        return False, str(e)
+        _fal_set_status(status, status_lock, oid, f"ERR: {str(e)[:40]}")
+        timings["total_s"] = time.perf_counter() - t_total0
+        return False, str(e), timings
     if not isinstance(result, dict):
-        return False, "unexpected fal result type"
+        _fal_set_status(status, status_lock, oid, "ERR: unexpected result")
+        timings["total_s"] = time.perf_counter() - t_total0
+        return False, "unexpected fal result type", timings
     model_glb = result.get("model_glb") or {}
     url = model_glb.get("url") if isinstance(model_glb, dict) else None
     if not isinstance(url, str) or not url:
-        return False, "no model_glb.url in fal response"
+        _fal_set_status(status, status_lock, oid, "ERR: no GLB URL")
+        timings["total_s"] = time.perf_counter() - t_total0
+        return False, "no model_glb.url in fal response", timings
     try:
+        _fal_set_status(status, status_lock, oid, "downloading GLB…")
+        t0 = time.perf_counter()
         glb_out.parent.mkdir(parents=True, exist_ok=True)
         urlretrieve(url, str(glb_out))
+        timings["download_s"] = time.perf_counter() - t0
     except Exception as e:
-        return False, f"download failed: {e}"
-    return glb_out.is_file(), "ok"
+        _fal_set_status(status, status_lock, oid, f"ERR: {str(e)[:40]}")
+        timings["total_s"] = time.perf_counter() - t_total0
+        return False, f"download failed: {e}", timings
+    timings["total_s"] = time.perf_counter() - t_total0
+    ok = glb_out.is_file()
+    _fal_set_status(status, status_lock, oid, "done" if ok else "ERR: file missing")
+    return ok, "ok" if ok else "glb not written", timings
 
 
-def _wait_fal_progress_ui(seed_frame, seed_mask_bool, futures_map, win_name) -> dict:
-    status: dict = {oid: "queued…" for oid in futures_map.values()}
+def _format_fal_result_log(oid: int, ok: bool, msg: str, timings: dict) -> str:
+    if ok and timings:
+        return (
+            f"  ID{oid} fal: OK — upload {timings['upload_s']:.1f}s, "
+            f"infer {timings['infer_s']:.1f}s, download {timings['download_s']:.1f}s "
+            f"(total {timings['total_s']:.1f}s)"
+        )
+    return f"  ID{oid} fal: FAIL — {msg}"
+
+
+def _wait_fal_progress_ui(
+    seed_frame,
+    seed_mask_bool,
+    futures_map,
+    fal_status: dict[int, str],
+    status_lock: threading.Lock,
+    win_name,
+) -> dict:
     results: dict = {}
 
     def draw():
@@ -1327,11 +1433,14 @@ def _wait_fal_progress_ui(seed_frame, seed_mask_bool, futures_map, win_name) -> 
             vis[seed_mask_bool[oid]] = vis[seed_mask_bool[oid]] * 0.35 + c * 0.65
         vis = vis.astype(np.uint8)
         y = 26
-        cv2.putText(vis, "Waiting for fal SAM3D…", (12, y),
+        cv2.putText(vis, "fal SAM3D (parallel per ID)", (12, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
         y += 22
+        with status_lock:
+            status_snapshot = dict(fal_status)
         for oid in sorted(seed_mask_bool.keys()):
-            cv2.putText(vis, f"ID{oid}: {status.get(oid, '')}", (12, y),
+            line = status_snapshot.get(oid, "queued…")
+            cv2.putText(vis, f"ID{oid}: {line}", (12, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 255), 2)
             y += 20
         return vis
@@ -1343,18 +1452,26 @@ def _wait_fal_progress_ui(seed_frame, seed_mask_bool, futures_map, win_name) -> 
             if fut.done():
                 oid = futures_map[fut]
                 try:
-                    ok, msg = fut.result()
+                    ok, msg, timings = fut.result()
                 except Exception as e:
-                    ok, msg = False, str(e)
-                results[oid] = (ok, msg)
-                status[oid]  = "done" if ok else f"ERR: {msg[:40]}"
+                    ok, msg, timings = False, str(e), {}
+                results[oid] = (ok, msg, timings)
+                with status_lock:
+                    fal_status[oid] = "done" if ok else f"ERR: {msg[:40]}"
                 pending.discard(fut)
         cv2.imshow(win_name, draw())
         if cv2.waitKey(30) & 0xFF in (ord("q"), 27):
             break
     for fut, oid in futures_map.items():
         if oid not in results:
-            results[oid] = fut.result() if fut.done() else (False, "interrupted")
+            if fut.done():
+                try:
+                    ok, msg, timings = fut.result()
+                except Exception as e:
+                    ok, msg, timings = False, str(e), {}
+                results[oid] = (ok, msg, timings)
+            else:
+                results[oid] = (False, "interrupted", {})
     cv2.destroyWindow(win_name)
     return results
 
@@ -1442,6 +1559,14 @@ def _load_mesh_and_register(oid, glb_path, mb, K, dist, mesh_in_cm: bool = False
     st: dict = {}
     if np.any(mb):
         st = est.estimate_pose(mb, K, dist, st)
+        if mesh_in_cm and st.get("tvec") is not None:
+            ds = _sam3d_registration_depth_scale(est, mb, K, st["tvec"])
+            st["registration_depth_scale"] = ds
+            tz0 = abs(float(np.asarray(st["tvec"], dtype=np.float64).reshape(3)[2]))
+            print(
+                f"[ID{oid}] SAM3D depth scale: {ds:.3f}  "
+                f"(seed tz={tz0:.1f} cm → ~{tz0 * ds:.1f} cm after pinhole fit)"
+            )
     print(f"[ID{oid}] estimator ready  pnp_n={est._pnp_n}"
           + ("  (repaired cache)" if use_cache else ""))
     return oid, est, st
@@ -1575,21 +1700,30 @@ def run(args) -> None:
         print("Uploading seed image to fal …")
         image_url = fal_client.upload_file(str(seed_png))
 
-    # Download GLBs in parallel.
+    # Download GLBs in parallel (per-ID status + timing).
+    fal_status: dict[int, str] = {int(oid): "queued…" for oid in seed_masks_raw}
+    fal_status_lock = threading.Lock()
     futures_map: dict = {}
     with ThreadPoolExecutor(max_workers=max(1, len(seed_masks_raw))) as ex:
         for oid in sorted(seed_masks_raw.keys()):
             fut = ex.submit(
-                _fal_download_glb, args.fal_model, args.seed, image_url,
+                _fal_download_glb,
+                args.fal_model, args.seed, image_url,
                 work_dir / f"mask_{oid}.png", work_dir / f"object_{oid}.glb",
+                oid=int(oid),
+                status=fal_status,
+                status_lock=fal_status_lock,
             )
             futures_map[fut] = oid
         fal_results = _wait_fal_progress_ui(
-            seed_frame, seed_masks_raw, futures_map, "fal SAM3D")
+            seed_frame, seed_masks_raw, futures_map,
+            fal_status, fal_status_lock, "fal SAM3D",
+        )
 
-    for oid, (ok, msg) in fal_results.items():
-        print(f"  ID{oid} fal: {'OK' if ok else 'FAIL'} — {msg}")
-    print(f"Timing: fal SAM3D = {time.perf_counter()-t_3d0:.3f}s")
+    for oid in sorted(fal_results.keys()):
+        ok, msg, timings = fal_results[oid]
+        print(_format_fal_result_log(int(oid), ok, msg, timings))
+    print(f"Timing: fal SAM3D wall = {time.perf_counter()-t_3d0:.3f}s")
 
     # Load GLBs + initial pose in parallel.
     mesh_estimators: dict[int, MeshPoseEstimator] = {}
