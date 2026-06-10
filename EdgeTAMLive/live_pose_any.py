@@ -24,6 +24,7 @@ Usage:
     python live_pose_any.py --calibrate-only --camera 0
     python live_pose_any.py --show-calibration
     python live_pose_any.py --camera 0
+    python plot_poses_3d.py --csv posesN.csv --show   # post-run 3D trajectories
 """
 
 from __future__ import annotations
